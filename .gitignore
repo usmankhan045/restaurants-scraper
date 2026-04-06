@@ -1,0 +1,21 @@
+# Environments / Credentials
+.env
+.venv/
+credentials.json
+*.json
+!blender_output.json
+!workflows/**/*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Data & Temp logs
+.tmp/
+data/
+*.log
+pyright_errors*.txt
+
+# IDE
+.vscode/
+.idea/

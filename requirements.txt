@@ -1,0 +1,6 @@
+seleniumbase
+selenium
+pandas
+rapidfuzz
+gspread
+google-auth

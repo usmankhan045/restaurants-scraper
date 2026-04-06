@@ -1,0 +1,86 @@
+name: Scraper Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  scout_and_extract:
+    name: Scout & Extract
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run Scout and Extractor
+        run: |
+          mkdir -p .tmp
+          echo "Running scout and extractor for part ${{ matrix.runner_index }}"
+          # Replace with your actual command. Ensures output is stored in .tmp/
+          # python tools/scout.py --part ${{ matrix.runner_index }} --out_dir .tmp/
+
+      - name: Upload .tmp Artifacts
+        if: always() # Fail-safe: runs even if previous steps fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmp-artifacts-${{ matrix.runner_index }}
+          path: .tmp/
+          retention-days: 7
+
+  collector:
+    name: Blender & Sync
+    needs: [scout_and_extract] # Waits for all 20 matrix jobs to be 100% finished
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install gspread google-auth
+
+      - name: Download all .tmp artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .tmp_all/
+
+      - name: Run Blender
+        run: |
+          echo "Running blender script to combine outputs into blender_output.json"
+          # Example blender command:
+          # python tools/blender.py --input_dir .tmp_all/ --output blender_output.json
+          
+      - name: Run Google Sheets Sync
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          BLENDER_OUTPUT: "blender_output.json"
+        run: |
+          python tools/sync.py
+
+      - name: Upload Final Output (Fail-Safe)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-blender-output
+          path: blender_output.json
+          retention-days: 7
