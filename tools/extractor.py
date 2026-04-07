@@ -707,12 +707,33 @@ class LegalExtractor:
                 "email":        "",
             }
 
-        return {
+        fields = {
             "owner":        self._extract_owner(text),
             "legal_entity": self._extract_entity(text),
             "phone":        self._extract_phone(text),
             "email":        self._extract_email(text),
         }
+
+        # Corporate Blacklist Filter
+        banned_entities = ["uber portier", "wolt enterprises", "uber eats", "wolt.com", "uber.com"]
+        banned_emails = ["support@uber.com", "support@wolt.com", "hilfe@uber.com", "privacy@uber.com"]
+
+        if fields.get("email"):
+            if any(banned in fields["email"].lower() for banned in banned_emails):
+                fields["email"] = None
+
+        if fields.get("owner"):
+            if any(banned in fields["owner"].lower() for banned in banned_entities):
+                fields["owner"] = None
+
+        if fields.get("legal_entity"):
+            if any(banned in fields["legal_entity"].lower() for banned in banned_entities):
+                fields["legal_entity"] = None
+
+        if not fields.get("email") and not fields.get("owner") and not fields.get("legal_entity"):
+            return {}
+
+        return fields
 
     def _extract_owner(self, text: str) -> str:
         """

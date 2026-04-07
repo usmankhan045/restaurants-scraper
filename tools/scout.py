@@ -66,6 +66,11 @@ PLATFORM_CONFIG = {
     "wolt": {
         "url": "https://wolt.com/de/discovery",
         "selectors": {
+            "venue_rating": [
+                "[data-test-id='venue-card-rating']",
+                "[class*='VenueRating']",
+                "div[class*='rating']"
+            ],
             "address_input": [
                 "input[data-test-id='address-input']",  # 2024 UI Update
                 "[data-test-id='front-page-address-input']",
@@ -134,6 +139,11 @@ PLATFORM_CONFIG = {
     "uber": {
         "url": "https://www.ubereats.com/de",
         "selectors": {
+            "venue_rating": [
+                "div[data-testid='store-rating']",
+                "span[data-testid='rich-text']",
+                "//div[contains(text(), '(')]"
+            ],
             "address_input": [
                 "input#location-typeahead-home-input",
                 "input[placeholder*='adresse']",
@@ -629,6 +639,9 @@ class UnifiedScout:
             # --- Closed status ---
             is_closed = self._is_card_closed(card_el)
 
+            # --- Rating & Reviews ---
+            rating, reviews = self._extract_rating_from_card(card_el)
+
             return {
                 "name":       name,
                 "url":        clean_url,
@@ -637,6 +650,8 @@ class UnifiedScout:
                 "zip_code":   zip_code,
                 "scraped_at": _now_iso(),
                 "worker_id":  self.worker_id,
+                "rating":     rating,
+                "reviews":    reviews,
             }
         except Exception:
             return None
@@ -690,6 +705,25 @@ class UnifiedScout:
             pass
 
         return "Unknown"
+
+    def _extract_rating_from_card(self, card_el) -> tuple[str, str]:
+        """Try each venue_rating selector and extract rating and reviews."""
+        for sel in self.cfg["selectors"].get("venue_rating", []):
+            try:
+                if _is_xpath(sel):
+                    els = card_el.find_elements(By.XPATH, sel)
+                else:
+                    els = card_el.find_elements(By.CSS_SELECTOR, sel)
+                for el in els:
+                    text = el.text.strip()
+                    if text:
+                        import re
+                        m = re.search(r"([\d.,]+)\s*\(([\d.,kK+]+)\)", text)
+                        if m:
+                            return m.group(1).strip(), m.group(2).strip()
+            except Exception:
+                continue
+        return "N/A", "N/A"
 
     def _is_card_closed(self, card_el) -> bool:
         """Return True if any closed-indicator is found within the card."""
