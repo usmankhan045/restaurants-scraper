@@ -1,7 +1,10 @@
 name: Scraper Pipeline
 
 on:
-  workflow_dispatch: # Recommended for manual testing first
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   # PHASE 1: Generate ZIP chunks (One-time setup)
@@ -12,11 +15,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
+      
+      - name: Install Setup Dependencies
+        run: |
+          pip install requests  # Required by plz_gen.py
+          
       - name: Generate PLZ Master and Chunks
         run: |
           mkdir -p data .tmp/chunks
           python tools/plz_gen.py
           python tools/chunker.py
+          
       - name: Upload Chunks
         uses: actions/upload-artifact@v4
         with:
@@ -36,28 +45,34 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
+        
       - name: Download Chunks
         uses: actions/download-artifact@v4
         with: { name: plz-chunks, path: .tmp/chunks/ }
+        
       - name: Install Dependencies
         run: |
-          pip install seleniumbase
+          pip install -r requirements.txt
           sbase install chromedriver
+          
       - name: Run Scout (Discovery)
         run: |
-          # Matches scout.py arguments: --chunk-file and --worker-id
-          python tools/scout.py --chunk-file .tmp/chunks/chunk_$(printf "%02d" ${{ matrix.runner_index }}).json --worker-id ${{ matrix.runner_index }}
+          # Formats index to match chunk filenames (e.g., chunk_01.json)
+          CHUNK_NAME=$(printf "chunk_%02d.json" ${{ matrix.runner_index }})
+          python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id ${{ matrix.runner_index }}
+          
       - name: Run Extractor (Deep Detail)
         run: |
-          # Matches extractor.py arguments: --worker-id
           python tools/extractor.py --worker-id ${{ matrix.runner_index }}
+          
       - name: Upload Worker Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: worker-data-${{ matrix.runner_index }}
           path: .tmp/*.jsonl
 
-  # PHASE 3: Merge and Sync
+  # PHASE 4: Merge and Sync (WF-08)
   collector:
     name: Blender & Sync
     needs: scout_and_extract
@@ -66,19 +81,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
+        
       - name: Install Dependencies
-        run: pip install gspread google-auth pandas rapidfuzz
+        run: pip install -r requirements.txt
+        
       - name: Download All Data
         uses: actions/download-artifact@v4
         with: { path: .tmp_all/ }
+        
       - name: Run Blender
         run: |
-          # Combine all extracted files into one wolt and one uber list for the blender
+          mkdir -p .tmp
+          # Merges all worker extraction files into one for the blender
           cat .tmp_all/worker-data-*/extracted_*.jsonl > .tmp/all_extracted.jsonl
-          # Note: Since your current blender expects two separate files, 
-          # you would ideally split this by platform, or update blender.py 
-          # to take a single directory.
+          # Note: Since current blender expects wolt/uber files, we pass the same merged file
           python tools/blender.py --wolt-file .tmp/all_extracted.jsonl --uber-file .tmp/all_extracted.jsonl --output-json blender_output.json
+          
       - name: Run Google Sheets Sync
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
