@@ -64,7 +64,7 @@ def main():
             worksheet = sh.add_worksheet(title=worksheet_name, rows=1000, cols=20)
             
     except Exception as e:
-        logging.error(f"Failed to authenticate or open sheet: {e}")
+        logging.exception("Failed to authenticate or open sheet")
         sys.exit(1)
 
     data = get_blender_data(blender_file)
