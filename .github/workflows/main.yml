@@ -17,9 +17,9 @@ jobs:
         with: { python-version: '3.10' }
       
       - name: Install Setup Dependencies
-        run: |
-          pip install requests  # Required by plz_gen.py
+        run: pip install requests
           
+      # WF-01 & WF-02
       - name: Generate PLZ Master and Chunks
         run: |
           mkdir -p data .tmp/chunks
@@ -55,12 +55,13 @@ jobs:
           pip install -r requirements.txt
           sbase install chromedriver
           
+      # WF-03 (Wolt) & WF-04 (Uber Eats)
       - name: Run Scout (Discovery)
         run: |
-          # Formats index to match chunk filenames (e.g., chunk_01.json)
           CHUNK_NAME=$(printf "chunk_%02d.json" ${{ matrix.runner_index }})
           python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id ${{ matrix.runner_index }}
           
+      # WF-06 & WF-07
       - name: Run Extractor (Deep Detail)
         run: |
           python tools/extractor.py --worker-id ${{ matrix.runner_index }}
@@ -72,7 +73,7 @@ jobs:
           name: worker-data-${{ matrix.runner_index }}
           path: .tmp/*.jsonl
 
-  # PHASE 4: Merge and Sync (WF-08)
+  # PHASE 3: Merge and Sync (WF-08)
   collector:
     name: Blender & Sync
     needs: scout_and_extract
@@ -92,9 +93,9 @@ jobs:
       - name: Run Blender
         run: |
           mkdir -p .tmp
-          # Merges all worker extraction files into one for the blender
+          # Combine all worker extraction files into one
           cat .tmp_all/worker-data-*/extracted_*.jsonl > .tmp/all_extracted.jsonl
-          # Note: Since current blender expects wolt/uber files, we pass the same merged file
+          # Current blender expects wolt/uber files, passing merged file as both
           python tools/blender.py --wolt-file .tmp/all_extracted.jsonl --uber-file .tmp/all_extracted.jsonl --output-json blender_output.json
           
       - name: Run Google Sheets Sync
