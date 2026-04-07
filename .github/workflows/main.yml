@@ -66,12 +66,26 @@ jobs:
       - name: Create Unique URL Shards
         run: |
           mkdir -p .tmp/shards
+          touch .tmp/unique_urls.jsonl
           # Combine all results from all platforms and workers
-          find .tmp_all -name "results_*.jsonl" -exec cat {} + | sort -u -t '"' -k 4,4 > .tmp/unique_urls.jsonl
-          # Split into shards without leading-zero padding to match the index-based matrix
-          split -l $(($(wc -l < .tmp/unique_urls.jsonl)/5 + 1)) .tmp/unique_urls.jsonl .tmp/shards/shard_
-          # Rename shards to explicitly match matrix shard_index [1, 2, 3, 4, 5]
-          i=1; for f in .tmp/shards/shard_*; do mv "$f" ".tmp/results_ext-$i.jsonl"; i=$((i+1)); done
+          find .tmp_all -type f -name "results_*.jsonl" -exec cat {} + | sort -u -t '"' -k 4,4 > .tmp/unique_urls.jsonl || true
+          
+          # Initialize all 5 shards as empty files so extraction matrix jobs don't fail
+          for i in {1..5}; do touch ".tmp/results_ext-$i.jsonl"; done
+          
+          lines=$(wc -l < .tmp/unique_urls.jsonl)
+          if [ "$lines" -gt 0 ]; then
+            # Split into shards without leading-zero padding
+            split -l $((lines/5 + 1)) .tmp/unique_urls.jsonl .tmp/shards/shard_
+            # Rename shards to explicitly match matrix shard_index [1, 2, 3, 4, 5]
+            i=1
+            for f in .tmp/shards/shard_*; do
+              if [ -e "$f" ]; then
+                mv "$f" ".tmp/results_ext-$i.jsonl"
+                i=$((i+1))
+              fi
+            done
+          fi
       - name: Upload Shards
         uses: actions/upload-artifact@v4
         with:
