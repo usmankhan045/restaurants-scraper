@@ -1,97 +1,87 @@
 name: Scraper Pipeline
 
 on:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Recommended for manual testing first
 
 jobs:
+  # PHASE 1: Generate ZIP chunks (One-time setup)
+  setup:
+    name: Generate Chunks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - name: Generate PLZ Master and Chunks
+        run: |
+          mkdir -p data .tmp/chunks
+          python tools/plz_gen.py
+          python tools/chunker.py
+      - name: Upload Chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: plz-chunks
+          path: .tmp/chunks/
+
+  # PHASE 2: Parallel Scraping and Extraction
   scout_and_extract:
     name: Scout & Extract
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Splits the 8,200 ZIP codes into 20 parallel chunks
         runner_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-    
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Scraper Dependencies
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - name: Download Chunks
+        uses: actions/download-artifact@v4
+        with: { name: plz-chunks, path: .tmp/chunks/ }
+      - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install seleniumbase
-          # Ensures the correct browser driver is installed for SeleniumBase UC Mode
           sbase install chromedriver
-
-      - name: Run Scout and Extractor
+      - name: Run Scout (Discovery)
         run: |
-          mkdir -p .tmp
-          echo "Running scout and extractor for part ${{ matrix.runner_index }}"
-          # Execution command is now active (uncommented)
-          python tools/scout.py --part ${{ matrix.runner_index }} --out_dir .tmp/
-
-      - name: Upload .tmp Artifacts
-        if: always()
+          # Matches scout.py arguments: --chunk-file and --worker-id
+          python tools/scout.py --chunk-file .tmp/chunks/chunk_$(printf "%02d" ${{ matrix.runner_index }}).json --worker-id ${{ matrix.runner_index }}
+      - name: Run Extractor (Deep Detail)
+        run: |
+          # Matches extractor.py arguments: --worker-id
+          python tools/extractor.py --worker-id ${{ matrix.runner_index }}
+      - name: Upload Worker Results
         uses: actions/upload-artifact@v4
         with:
-          name: tmp-artifacts-${{ matrix.runner_index }}
-          path: .tmp/
-          retention-days: 7
+          name: worker-data-${{ matrix.runner_index }}
+          path: .tmp/*.jsonl
 
+  # PHASE 3: Merge and Sync
   collector:
     name: Blender & Sync
-    needs: [scout_and_extract]
+    needs: scout_and_extract
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Processing Dependencies
-        run: |
-          # Added pandas and rapidfuzz for the blender logic, gspread for the sync logic
-          pip install gspread google-auth pandas rapidfuzz
-
-      - name: Download all .tmp artifacts
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - name: Install Dependencies
+        run: pip install gspread google-auth pandas rapidfuzz
+      - name: Download All Data
         uses: actions/download-artifact@v4
-        with:
-          path: .tmp_all/
-          # This pulls all JSON results from the 20 parallel runners
-
+        with: { path: .tmp_all/ }
       - name: Run Blender
         run: |
-          echo "Running blender script to combine outputs into blender_output.json"
-          # Execution command is now active (uncommented)
-          python tools/blender.py --input_dir .tmp_all/ --output blender_output.json
-          
+          # Combine all extracted files into one wolt and one uber list for the blender
+          cat .tmp_all/worker-data-*/extracted_*.jsonl > .tmp/all_extracted.jsonl
+          # Note: Since your current blender expects two separate files, 
+          # you would ideally split this by platform, or update blender.py 
+          # to take a single directory.
+          python tools/blender.py --wolt-file .tmp/all_extracted.jsonl --uber-file .tmp/all_extracted.jsonl --output-json blender_output.json
       - name: Run Google Sheets Sync
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           BLENDER_OUTPUT: "blender_output.json"
-        run: |
-          # This script will now find the blender_output.json file it was missing
-          python tools/sync.py
-
-      - name: Upload Final Output (Fail-Safe)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-blender-output
-          path: blender_output.json
-          retention-days: 7
+        run: python tools/sync.py
