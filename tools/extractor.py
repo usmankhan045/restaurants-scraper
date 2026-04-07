@@ -700,12 +700,7 @@ class LegalExtractor:
         Always returns all keys (empty string when not found).
         """
         if not text:
-            return {
-                "owner":        "",
-                "legal_entity": "",
-                "phone":        "",
-                "email":        "",
-            }
+            return {"owner": "", "legal_entity": "", "phone": "", "email": ""}
 
         fields = {
             "owner":        self._extract_owner(text),
@@ -714,9 +709,14 @@ class LegalExtractor:
             "email":        self._extract_email(text),
         }
 
-        # Corporate Blacklist Filter
+        # CORPORATE BLACKLIST: Identify Platform Overrides
         banned_entities = ["uber portier", "wolt enterprises", "uber eats", "wolt.com", "uber.com"]
         banned_emails = ["support@uber.com", "support@wolt.com", "hilfe@uber.com", "privacy@uber.com"]
+        
+        # Dutch (Uber) and Finnish (Wolt) corporate numbers
+        if fields.get("phone"):
+            if fields["phone"].startswith("+31") or fields["phone"].startswith("0031") or fields["phone"].startswith("+358"):
+                fields["phone"] = None
 
         if fields.get("email"):
             if any(banned in fields["email"].lower() for banned in banned_emails):
@@ -730,8 +730,10 @@ class LegalExtractor:
             if any(banned in fields["legal_entity"].lower() for banned in banned_entities):
                 fields["legal_entity"] = None
 
+        # FIX: Explicitly label missing local data as obscured by the platform
         if not fields.get("email") and not fields.get("owner") and not fields.get("legal_entity"):
-            return {}
+            fields["owner"] = "Hidden by Platform"
+            fields["legal_entity"] = "Hidden by Platform"
 
         return fields
 
