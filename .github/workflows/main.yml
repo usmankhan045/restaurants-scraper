@@ -23,6 +23,7 @@ jobs:
         with:
           name: plz-chunks
           path: .tmp/chunks/
+          include-hidden-files: true
 
   discovery:
     name: Discovery (Scout)
@@ -31,7 +32,6 @@ jobs:
     strategy:
       matrix:
         runner_index: [1, 2, 3, 4, 5]
-        # Run both platforms to get complete data
         platform: [wolt, uber]
     steps:
       - uses: actions/checkout@v4
@@ -45,13 +45,13 @@ jobs:
       - name: Run Scout
         run: |
           CHUNK_NAME=$(printf "chunk_%02d.json" ${{ matrix.runner_index }})
-          # Added --platform flag to support unified scouting
           python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id scout-${{ matrix.platform }}-${{ matrix.runner_index }} --platform ${{ matrix.platform }}
       - name: Upload Raw URLs
         uses: actions/upload-artifact@v4
         with:
           name: raw-urls-${{ matrix.platform }}-${{ matrix.runner_index }}
           path: .tmp/results_*.jsonl
+          include-hidden-files: true
 
   deduplicate:
     name: Unique URL Registry
@@ -67,17 +67,14 @@ jobs:
         run: |
           mkdir -p .tmp/shards
           touch .tmp/unique_urls.jsonl
-          # Combine all results from all platforms and workers
+          
           find .tmp_all -type f -name "results_*.jsonl" -exec cat {} + | sort -u -t '"' -k 4,4 > .tmp/unique_urls.jsonl || true
           
-          # Initialize all 5 shards as 1-byte files (space) so extraction matrix jobs don't fail
           for i in {1..5}; do echo " " > ".tmp/results_ext-$i.jsonl"; done
           
           lines=$(wc -l < .tmp/unique_urls.jsonl)
           if [ "$lines" -gt 0 ]; then
-            # Split into shards without leading-zero padding
             split -l $((lines/5 + 1)) .tmp/unique_urls.jsonl .tmp/shards/shard_
-            # Rename shards to explicitly match matrix shard_index [1, 2, 3, 4, 5]
             i=1
             for f in .tmp/shards/shard_*; do
               if [ -e "$f" ]; then
@@ -110,7 +107,6 @@ jobs:
         run: pip install -r requirements.txt && sbase install chromedriver
       - name: Run Extractor
         run: |
-          # Extractor now finds exactly '.tmp/results_ext-1.jsonl' etc.
           python tools/extractor.py --worker-id ext-${{ matrix.shard_index }}
       - name: Upload Worker Detail
         if: always()
@@ -118,6 +114,7 @@ jobs:
         with:
           name: detail-${{ matrix.shard_index }}
           path: .tmp/extracted_*.jsonl
+          include-hidden-files: true
 
   collector:
     name: Blender & Sync
@@ -137,10 +134,11 @@ jobs:
           find .tmp_all -name "extracted_*.jsonl" -exec cat {} + > .tmp/all_extracted.jsonl
           grep '"platform": "wolt"' .tmp/all_extracted.jsonl > .tmp/wolt_extracted.jsonl || true
           grep '"platform": "uber"' .tmp/all_extracted.jsonl > .tmp/uber_extracted.jsonl || true
-          python tools/blender.py --wolt-file .tmp/wolt_extracted.jsonl --uber-file .tmp/uber_extracted.jsonl --output-json blender_output.json
+          # FORCE CSV OUTPUT FOR SYNC TOOL
+          python tools/blender.py --wolt-file .tmp/wolt_extracted.jsonl --uber-file .tmp/uber_extracted.jsonl --output-csv blender_output.csv
       - name: Run Google Sheets Sync
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          BLENDER_OUTPUT: "blender_output.json"
+          BLENDER_OUTPUT: "blender_output.csv"
         run: python tools/sync.py
