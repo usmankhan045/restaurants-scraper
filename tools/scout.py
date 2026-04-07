@@ -1,25 +1,17 @@
 """
-WAT Framework — WF-03: Wolt Restaurant Scout
-Scrapes restaurant name, URL, and open/closed status from Wolt.com
-for every German ZIP code assigned to this worker.
+WAT Framework — WF-03: Unified Restaurant Scout (Production Grade)
+Scrapes restaurant metadata from Wolt.com and UberEats.com.
 
-Concurrency model:
-    20 parallel instances, each writing to its own JSONL file.
-    No shared file — zero write collisions by design.
+Features:
+    - Human-mimicry typing and interaction delays.
+    - Smart-scroll logic with "Show More" button detection.
+    - Platform-aware selection engine.
+    - Atomic State Management (Resumes exactly where it left off).
+    - Per-worker JSONL logging (No file locks required).
 
 Usage:
-    # Process a full chunk (typical production use)
-    python tools/scout.py --chunk-file .tmp/chunks/chunk_01.json --worker-id worker-01
-
-    # Single ZIP (development / debugging)
-    python tools/scout.py --zip 10115 --worker-id dev
-
-    # Include closed restaurants in output
-    python tools/scout.py --chunk-file .tmp/chunks/chunk_01.json --worker-id worker-01 --save-closed
-
-Output:
-    .tmp/results_{worker_id}.jsonl  — one JSON record per restaurant per line
-    .tmp/checkpoint_scout_{worker_id}.json — progress checkpoint (resume on restart)
+    python tools/scout.py --chunk-file .tmp/chunks/chunk_01.json --worker-id scout-wolt-1 --platform wolt
+    python tools/scout.py --chunk-file .tmp/chunks/chunk_01.json --worker-id scout-uber-1 --platform uber
 """
 
 import argparse
@@ -29,7 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -44,102 +36,106 @@ from tools.logger import ScraperLogger
 from tools.state_manager import StateManager
 
 # ---------------------------------------------------------------------------
-# Timing constants
+# Timing & Human Mimicry Constants
 # ---------------------------------------------------------------------------
 
-KEYPRESS_DELAY_MS   = (50, 180)    # per-character delay range (milliseconds)
-KEYPRESS_BURST_PROB = 0.12         # probability of a longer "thinking" pause
-KEYPRESS_BURST_MS   = (250, 600)   # range for those longer pauses
+KEYPRESS_DELAY_MS   = (45, 160)    # character delay
+KEYPRESS_BURST_PROB = 0.15         # probability of a "thinking" pause
+KEYPRESS_BURST_MS   = (200, 550)   # longer pause range
 
-SCROLL_STALE_TIMEOUT = 3.0         # seconds of no new cards before stopping
-SCROLL_PAUSE         = (0.9, 1.6)  # random pause after each scroll action
-SHOW_MORE_MAX        = 25          # safety cap on "Show More" clicks
-POST_LOAD_WAIT       = (1.8, 3.2)  # wait after ZIP suggestion is clicked
+SCROLL_STALE_TIMEOUT = 4.0         # seconds to wait for new cards
+SCROLL_PAUSE         = (1.2, 2.4)  # random pause after scroll
+SHOW_MORE_MAX        = 40          # safety cap on pagination
+POST_LOAD_WAIT       = (2.5, 4.5)  # wait after address selection
 
 # ---------------------------------------------------------------------------
-# Wolt selectors
-# Organised as priority-ordered lists — first match wins.
-# CSS selectors are tried before XPath (faster in DOM).
+# Platform Selector Matrix
 # ---------------------------------------------------------------------------
 
-# Wolt discovery / address input
-WOLT_URL = "https://wolt.com/de/discovery"
-
-ADDRESS_INPUT = [
-    "[data-test-id='front-page-address-input']",
-    "[data-test-id='address-search-input']",
-    "input[placeholder*='Adresse']",
-    "input[placeholder*='adresse']",
-    "input[placeholder*='Lieferadresse']",
-    "//input[contains(@placeholder,'Adresse')]",
-    "//input[contains(@placeholder,'adresse')]",
-    "//input[@type='text'][contains(@aria-label,'Adresse')]",
-]
-
-ADDRESS_SUGGESTION = [
-    "[data-test-id='address-suggestion-item']",
-    "[data-test-id='autocomplete-suggestion-item']",
-    "[data-test-id='address-item']",
-    "//ul[@data-test-id='address-suggestions']/li[1]",
-    "//ul[@role='listbox']/li[1]",
-    "//div[@role='option'][1]",
-    "//li[@role='option'][1]",
-]
-
-# Venue card root element (each instance = 1 restaurant)
-VENUE_CARD = [
-    "[data-test-id='venue-card']",
-    "a[href*='/restaurant/']",
-    "a[href*='/venue/']",
-    "[class*='VenueCard']",
-    "[class*='venue-card']",
-]
-
-# Selectors tried *within* a card element to extract the name
-VENUE_NAME = [
-    "[data-test-id='venue-card-header']",
-    "[data-test-id='venue-name']",
-    "h3",
-    "h2",
-    "[class*='VenueCard__name']",
-    "[class*='venue-card__name']",
-    "[class*='venueName']",
-    "//h3",
-]
-
-# Selectors tried *within* a card to detect "closed" state
-VENUE_CLOSED = [
-    "[data-test-id='venue-card-closed-badge']",
-    "[data-test-id='closed-badge']",
-    "[class*='closed']",
-    "[class*='Closed']",
-    "[class*='unavailable']",
-    "//span[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'geschlossen')]",
-    "//span[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'closed')]",
-]
-
-# Page-level "no restaurants in this area" indicators
-ZERO_RESULTS = [
-    "[data-test-id='discovery-no-venues']",
-    "[data-test-id='empty-venue-list']",
-    "[data-test-id='no-results']",
-    "//h1[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'keine')]",
-    "//h2[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'keine')]",
-    "//p[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'keine restaurant')]",
-    "//p[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'no restaurants')]",
-]
-
-# "Show More" / "Mehr anzeigen" button
-SHOW_MORE = [
-    "[data-test-id='venue-list-loadmore-btn']",
-    "[data-test-id='load-more-btn']",
-    "//button[normalize-space(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='mehr anzeigen']",
-    "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'mehr anzeigen')]",
-    "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
-    "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'load more')]",
-    "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'mehr anzeigen')]",
-]
-
+PLATFORM_CONFIG = {
+    "wolt": {
+        "url": "https://wolt.com/de/discovery",
+        "selectors": {
+            "address_input": [
+                "input[data-test-id='address-input']",  # 2024 Update
+                "[data-test-id='front-page-address-input']",
+                "[data-test-id='address-search-input']",
+                "input[placeholder*='Adresse']",
+                "//input[@type='text'][contains(@aria-label,'Adresse')]"
+            ],
+            "address_suggestion": [
+                "[data-test-id='address-suggestion-item']",
+                "[data-test-id='autocomplete-suggestion-item']",
+                "//ul[@data-test-id='address-suggestions']/li[1]",
+                "//li[@role='option'][1]"
+            ],
+            "venue_card": [
+                "[data-test-id='venue-card']",
+                "a[href*='/restaurant/']",
+                "a[href*='/venue/']",
+                "[class*='VenueCard']"
+            ],
+            "venue_name": [
+                "[data-test-id='venue-card-header']",
+                "h3", "h2",
+                "[class*='VenueCard__name']"
+            ],
+            "venue_closed": [
+                "[data-test-id='venue-card-closed-badge']",
+                "[class*='closed']",
+                "//span[contains(text(),'geschlossen')]"
+            ],
+            "zero_results": [
+                "[data-test-id='discovery-no-venues']",
+                "//h1[contains(.,'keine')]",
+                "//p[contains(.,'no restaurants')]"
+            ],
+            "show_more": [
+                "[data-test-id='venue-list-loadmore-btn']",
+                "//button[contains(.,'Mehr anzeigen')]",
+                "//button[contains(.,'show more')]"
+            ]
+        }
+    },
+    "uber": {
+        "url": "https://www.ubereats.com/de",
+        "selectors": {
+            "address_input": [
+                "input#location-typeahead-home-input",
+                "input[placeholder*='adresse']",
+                "//input[contains(@aria-label,'adresse')]"
+            ],
+            "address_suggestion": [
+                "li[role='option']",
+                "div[data-testid='location-typeahead-home-suggestion']",
+                "//ul/li[1]"
+            ],
+            "venue_card": [
+                "div[data-testid='store-card']",
+                "a[href*='/restaurant/']",
+                "a[href*='/store/']"
+            ],
+            "venue_name": [
+                "h3",
+                "div[data-testid='store-card-title']",
+                "div[data-testid='restaurant-name']"
+            ],
+            "venue_closed": [
+                "//span[contains(.,'Geschlossen')]",
+                "[data-testid='closed-badge']",
+                "[class*='Closed']"
+            ],
+            "zero_results": [
+                "//h1[contains(.,'Keine Ergebnisse')]",
+                "//div[contains(.,'keine Restaurants')]"
+            ],
+            "show_more": [
+                "//button[contains(.,'Mehr anzeigen')]",
+                "//button[contains(.,'Load more')]"
+            ]
+        }
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -148,83 +144,61 @@ SHOW_MORE = [
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def _is_xpath(sel: str) -> bool:
     return sel.startswith("//") or sel.startswith("(//")
 
-
 # ---------------------------------------------------------------------------
-# WoltScout
+# Scout Engine
 # ---------------------------------------------------------------------------
 
-class WoltScout:
+class ProductionScout:
     """
-    Scrapes restaurant listings from Wolt.com for a list of German ZIP codes.
-
-    Parameters
-    ----------
-    worker_id   : str  — unique worker name, drives filenames and logs
-    browser     : BrowserDriver — already-constructed driver (caller manages context)
-    log         : ScraperLogger
-    state       : StateManager — checkpoint keyed on worker_id
-    save_closed : bool — include closed restaurants in output (default False)
+    High-fidelity scout for finding unique restaurant URLs.
+    Includes explicit state persistence and human interaction loops.
     """
 
     def __init__(
         self,
+        platform_key: str,
         worker_id: str,
         browser: BrowserDriver,
         log: ScraperLogger,
         state: StateManager,
         save_closed: bool = False,
     ):
-        self.worker_id = worker_id
-        self.browser   = browser
-        self.log       = log
-        self.state     = state
-        self.save_closed = save_closed
+        self.platform_name = platform_key
+        self.cfg           = PLATFORM_CONFIG[platform_key]
+        self.worker_id     = worker_id
+        self.browser       = browser
+        self.log           = log
+        self.state         = state
+        self.save_closed   = save_closed
 
         self._out_path = ROOT / ".tmp" / f"results_{worker_id}.jsonl"
         self._out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
     def run(self, zip_codes: list[str]) -> dict:
-        """
-        Process all ZIP codes in zip_codes, skipping already-completed ones.
-        Returns the StateManager summary dict when finished.
-        """
+        """Main entry loop for processing assigned ZIP chunks."""
         remaining = self.state.pending(zip_codes)
         total = len(zip_codes)
-        skipped = total - len(remaining)
-
+        
         self.log.info(
             action="RUN_START",
-            message=f"{len(remaining)} ZIPs to process ({skipped} already done)",
+            message=f"Starting {self.platform_name} scout | {len(remaining)} ZIPs pending",
             total=total,
-            remaining=len(remaining),
             worker_id=self.worker_id,
         )
 
         for zip_code in remaining:
             self._process_zip_with_retry(zip_code)
 
-        summary = self.state.summary()
-        self.log.info(
-            action="RUN_COMPLETE",
-            message=str(summary),
-            worker_id=self.worker_id,
-        )
-        return summary
+        return self.state.summary()
 
     # ------------------------------------------------------------------
-    # ZIP-level orchestration
+    # ZIP-level Orchestration
     # ------------------------------------------------------------------
 
     def _process_zip_with_retry(self, zip_code: str):
-        """Retry wrapper around _process_zip with MAX_RETRIES attempts."""
         bound = self.log.bind(zip_code)
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -237,573 +211,243 @@ class WoltScout:
                     message=f"Attempt {attempt}/{MAX_RETRIES} failed: {exc}",
                 )
                 if attempt < MAX_RETRIES:
-                    # Restart browser between retries for a clean slate
                     try:
                         self.browser._restart()
-                    except Exception:
-                        pass
-                    time.sleep(random.uniform(3.0, 6.0))
+                    except: pass
+                    time.sleep(random.uniform(5.0, 10.0))
                 else:
-                    bound.error(
-                        action="ZIP_FAILED",
-                        message=f"All {MAX_RETRIES} attempts exhausted",
-                    )
+                    bound.error(action="ZIP_FAILED", message=f"Exhausted all retries")
                     self.state.mark_failed(zip_code, error=str(exc))
 
     def _process_zip(self, zip_code: str, bound):
-        """
-        Full scraping pipeline for a single ZIP code.
-        Raises on unrecoverable failure — caller handles retries.
-        """
         self.state.mark_in_progress(zip_code)
 
-        # 1. Navigate to Wolt and enter the ZIP code
-        ok = self._navigate_to_zip(zip_code, bound)
+        # 1. Navigation & Address Entry
+        ok = self._enter_location(zip_code, bound)
         if not ok:
-            raise RuntimeError("Navigation / address-entry failed")
+            raise RuntimeError(f"Failed to set location to {zip_code}")
 
-        # 2. Short settle wait for the listing to render
+        # 2. Results Check
         time.sleep(random.uniform(*POST_LOAD_WAIT))
-
-        # 3. Check for zero-results state before scrolling
         if self._is_zero_results():
-            bound.info(
-                action="ZERO_RESULTS",
-                status="SKIP",
-                message="No restaurants available in this area",
-            )
-            self.state.mark_completed(zip_code, metadata={"count": 0, "zero_results": True})
+            bound.info(action="ZERO_RESULTS", status="SKIP", message="No venues found")
+            self.state.mark_completed(zip_code, metadata={"count": 0, "zero": True})
             return
 
-        # 4. Smart scroll to load all cards
-        self._smart_scroll(zip_code, bound)
+        # 3. Smart Pagination & Scrolling
+        self._exhaustive_scroll(bound)
 
-        # 5. Extract all visible cards
-        raw_records = self._extract_all_cards(zip_code)
-        bound.info(
-            action="EXTRACT",
-            message=f"Extracted {len(raw_records)} cards (incl. closed)",
-            raw_count=len(raw_records),
-        )
-
-        # 6. Data Guard — filter closed unless --save-closed
+        # 4. Data Extraction
+        raw_records = self._extract_all_visible_cards(zip_code)
+        
+        # 5. Filtering (Open vs Closed)
         if not self.save_closed:
-            open_records = [r for r in raw_records if r["status"] == "open"]
-            closed_count = len(raw_records) - len(open_records)
-            if closed_count:
-                bound.info(
-                    action="FILTER_CLOSED",
-                    message=f"Dropped {closed_count} closed restaurants",
-                    dropped=closed_count,
-                )
-            records = open_records
+            records = [r for r in raw_records if r["status"] == "open"]
         else:
             records = raw_records
 
-        # 7. Persist to per-worker JSONL
+        # 6. Persistence
         self._save_records(records)
-
-        self.state.mark_completed(
-            zip_code,
-            metadata={"count": len(records), "closed_found": len(raw_records) - len(records)},
-        )
-        bound.info(
-            action="ZIP_DONE",
-            status="OK",
-            message=f"Saved {len(records)} restaurants",
-            saved=len(records),
-        )
+        
+        self.state.mark_completed(zip_code, metadata={"count": len(records)})
+        bound.info(action="ZIP_DONE", message=f"Extracted {len(records)} unique URLs")
 
     # ------------------------------------------------------------------
-    # Navigation — open Wolt and enter the ZIP code
+    # Interaction Layer (Human Mimicry)
     # ------------------------------------------------------------------
 
-    def _navigate_to_zip(self, zip_code: str, bound) -> bool:
-        """
-        1. Open Wolt discovery page (handles GDPR automatically via BrowserDriver).
-        2. Locate the address input field.
-        3. Type the ZIP code with human-like keypress delays.
-        4. Wait for autocomplete dropdown and click the first suggestion.
-        Returns True on success.
-        """
-        bound.info(action="NAVIGATE", status="TRY", message=f"Opening {WOLT_URL}")
-        ok = self.browser.open(WOLT_URL, gdpr=True)
-        if not ok:
-            bound.error(action="NAVIGATE", message="browser.open() failed")
+    def _enter_location(self, zip_code: str, bound) -> bool:
+        """Navigates to home and types ZIP code with human-like delays."""
+        self.browser.open(self.cfg["url"], gdpr=True)
+        
+        input_el = self._find_first(self.cfg["selectors"]["address_input"], timeout=15)
+        if not input_el:
+            bound.error(action="FIND_INPUT", message="Address bar not found")
             return False
 
-        # Locate address input
-        input_el = self._find_first(ADDRESS_INPUT, timeout=12)
-        if input_el is None:
-            bound.error(action="FIND_INPUT", message="Address input not found on page")
-            return False
-
-        # Clear any pre-filled text and type ZIP character by character
         try:
             input_el.clear()
-        except Exception:
-            pass
+        except: pass
 
-        self._type_zip_human(input_el, zip_code, bound)
+        # Type ZIP character by character
+        for char in zip_code:
+            input_el.send_keys(char)
+            delay = random.randint(*KEYPRESS_DELAY_MS)
+            if random.random() < KEYPRESS_BURST_PROB:
+                delay += random.randint(*KEYPRESS_BURST_MS)
+            time.sleep(delay / 1000.0)
 
-        # Wait for suggestion dropdown
-        time.sleep(random.uniform(0.8, 1.4))
-
-        # Click the first suggestion
-        clicked = self._click_suggestion(bound)
-        if not clicked:
-            bound.warning(
-                action="SUGGESTION",
-                status="FALLBACK",
-                message="No suggestion found — pressing Enter as fallback",
-            )
+        time.sleep(random.uniform(1.2, 2.0))
+        
+        # Select first suggestion
+        suggestion = self._find_first(self.cfg["selectors"]["address_suggestion"], timeout=5)
+        if suggestion:
             try:
-                input_el.send_keys(Keys.RETURN)
-                time.sleep(random.uniform(1.5, 2.5))
-            except Exception:
-                return False
+                ActionChains(self.browser.sb.driver).move_to_element(suggestion).click().perform()
+                return True
+            except: pass
 
-        bound.info(action="NAVIGATE", status="OK", message="ZIP entered and suggestion selected")
+        # Fallback to Enter key
+        input_el.send_keys(Keys.RETURN)
         return True
 
-    def _type_zip_human(self, element, zip_code: str, bound):
-        """
-        Send ZIP code keystrokes one character at a time with randomised delays
-        to mimic realistic human typing behaviour.
-        """
-        driver = self.browser.sb.driver
-        bound.debug(
-            action="TYPE_ZIP",
-            message=f"Typing {zip_code} ({len(zip_code)} chars)",
-        )
-        for char in zip_code:
-            delay_ms = random.randint(*KEYPRESS_DELAY_MS)
-            if random.random() < KEYPRESS_BURST_PROB:
-                delay_ms += random.randint(*KEYPRESS_BURST_MS)
+    def _exhaustive_scroll(self, bound):
+        """Scrolls and clicks 'Show More' until no new content appears."""
+        last_count = 0
+        stale_since = None
+        clicks = 0
 
-            actions = ActionChains(driver)
-            actions.move_to_element(element)
-            actions.send_keys_to_element(element, char)
-            actions.perform()
-            time.sleep(delay_ms / 1000.0)
-
-    def _click_suggestion(self, bound) -> bool:
-        """Click the first address autocomplete suggestion. Returns True if clicked."""
-        for sel in ADDRESS_SUGGESTION:
-            try:
-                if _is_xpath(sel):
-                    els = self.browser.sb.driver.find_elements(By.XPATH, sel)
-                else:
-                    els = self.browser.sb.driver.find_elements(By.CSS_SELECTOR, sel)
-
-                if els:
-                    target = els[0]
-                    ActionChains(self.browser.sb.driver).move_to_element(target).click().perform()
-                    time.sleep(random.uniform(0.4, 0.8))
-                    bound.debug(
-                        action="SUGGESTION",
-                        status="CLICKED",
-                        message=f"Clicked via selector: {sel[:60]}",
-                    )
-                    return True
-            except Exception:
-                continue
-        return False
-
-    # ------------------------------------------------------------------
-    # Zero-results detection
-    # ------------------------------------------------------------------
-
-    def _is_zero_results(self) -> bool:
-        """Return True if Wolt is showing a 'no restaurants in area' state."""
-        for sel in ZERO_RESULTS:
-            try:
-                if _is_xpath(sel):
-                    els = self.browser.sb.driver.find_elements(By.XPATH, sel)
-                else:
-                    els = self.browser.sb.driver.find_elements(By.CSS_SELECTOR, sel)
-                if els and any(e.is_displayed() for e in els):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    # ------------------------------------------------------------------
-    # Smart scroll — loads all cards before extraction
-    # ------------------------------------------------------------------
-
-    def _smart_scroll(self, zip_code: str, bound):
-        """
-        Scroll down in a loop until no new venue cards have appeared for
-        SCROLL_STALE_TIMEOUT seconds. If stale, attempt a 'Show More' click
-        before giving up. Caps Show More at SHOW_MORE_MAX for safety.
-        """
-        bound.info(action="SCROLL_START", message="Starting smart scroll")
-        last_count       = 0
-        stale_since: Optional[float] = None
-        show_more_clicks = 0
-
-        while True:
-            current_count = self._count_cards()
-
+        while clicks < SHOW_MORE_MAX:
+            current_count = len(self._get_card_elements())
+            
             if current_count > last_count:
-                bound.debug(
-                    action="SCROLL",
-                    status="PROGRESS",
-                    message=f"Cards: {last_count} → {current_count}",
-                    count=current_count,
-                )
-                last_count  = current_count
-                stale_since = None  # reset — new content arrived
-
+                last_count = current_count
+                stale_since = None
+                self.browser.scroll_to_bottom()
+                time.sleep(random.uniform(*SCROLL_PAUSE))
             else:
-                # No new cards this cycle
                 if stale_since is None:
                     stale_since = time.time()
                 elif time.time() - stale_since >= SCROLL_STALE_TIMEOUT:
-                    # Stale for 3 s — try "Show More" before giving up
-                    if show_more_clicks < SHOW_MORE_MAX:
-                        clicked = self._click_show_more()
-                        if clicked:
-                            show_more_clicks += 1
-                            stale_since = None
-                            bound.debug(
-                                action="SHOW_MORE",
-                                status="CLICKED",
-                                message=f"Show More click #{show_more_clicks}",
-                            )
-                            time.sleep(random.uniform(1.2, 2.2))
-                            continue
+                    # Attempt pagination click
+                    btn = self._find_first(self.cfg["selectors"]["show_more"], timeout=2)
+                    if btn and btn.is_displayed():
+                        clicks += 1
+                        self.browser.sb.driver.execute_script("arguments[0].click();", btn)
+                        stale_since = None
+                        time.sleep(2.0)
+                        continue
+                    break # truly finished
+            
+            time.sleep(1.0)
 
-                    # Nothing else to load
-                    bound.info(
-                        action="SCROLL_DONE",
-                        status="OK",
-                        message=f"Completed: {last_count} cards, {show_more_clicks} Show More clicks",
-                        total_cards=last_count,
-                        show_more_clicks=show_more_clicks,
-                    )
-                    break
+    # ------------------------------------------------------------------
+    # Extraction Layer
+    # ------------------------------------------------------------------
 
-            # Scroll down a bit and pause
-            self.browser.scroll_to_bottom()
-            time.sleep(random.uniform(*SCROLL_PAUSE))
+    def _extract_all_visible_cards(self, zip_code: str) -> List[Dict]:
+        cards = self._get_card_elements()
+        results = []
+        seen_urls = set()
 
-    def _count_cards(self) -> int:
-        """Return the number of venue card elements currently in the DOM."""
-        for sel in VENUE_CARD:
+        for card in cards:
             try:
-                if _is_xpath(sel):
-                    els = self.browser.sb.driver.find_elements(By.XPATH, sel)
-                else:
-                    els = self.browser.sb.driver.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    return len(els)
-            except Exception:
-                continue
-        return 0
+                # Get URL
+                url = ""
+                try:
+                    url = card.get_attribute("href") or card.find_element(By.TAG_NAME, "a").get_attribute("href")
+                except: continue
+                
+                if not url or not any(x in url for x in ["restaurant", "venue", "store"]):
+                    continue
+                
+                clean_url = url.split("?")[0].split("#")[0].rstrip("/")
+                if clean_url in seen_urls:
+                    continue
+                seen_urls.add(clean_url)
 
-    def _click_show_more(self) -> bool:
-        """Attempt to click a 'Show More' / 'Mehr anzeigen' button. Returns True if clicked."""
-        for sel in SHOW_MORE:
+                # Get Name
+                name = "Unknown"
+                for sel in self.cfg["selectors"]["venue_name"]:
+                    try:
+                        el = card.find_element(By.XPATH if _is_xpath(sel) else By.CSS_SELECTOR, sel)
+                        if el.text:
+                            name = el.text.strip()
+                            break
+                    except: continue
+
+                results.append({
+                    "name": name,
+                    "url": clean_url,
+                    "platform": self.platform_name,
+                    "zip_code": zip_code,
+                    "status": "closed" if self._is_closed(card) else "open",
+                    "scraped_at": _now_iso(),
+                    "worker_id": self.worker_id
+                })
+            except: continue
+
+        return results
+
+    def _is_closed(self, card_el) -> bool:
+        for sel in self.cfg["selectors"]["venue_closed"]:
             try:
-                if _is_xpath(sel):
-                    els = self.browser.sb.driver.find_elements(By.XPATH, sel)
-                else:
-                    els = self.browser.sb.driver.find_elements(By.CSS_SELECTOR, sel)
-
-                visible = [e for e in els if e.is_displayed() and e.is_enabled()]
-                if visible:
-                    self.browser.sb.driver.execute_script(
-                        "arguments[0].scrollIntoView({block:'center'});", visible[0]
-                    )
-                    time.sleep(0.3)
-                    visible[0].click()
+                if card_el.find_elements(By.XPATH if _is_xpath(sel) else By.CSS_SELECTOR, sel):
                     return True
-            except Exception:
-                continue
+            except: continue
         return False
 
-    # ------------------------------------------------------------------
-    # Card extraction
-    # ------------------------------------------------------------------
-
-    def _extract_all_cards(self, zip_code: str) -> list[dict]:
-        """
-        Extract restaurant data from all venue cards currently in the DOM.
-        Returns a list of dicts: {name, url, status, zip_code, scraped_at}.
-        Deduplicates by URL.
-        """
-        card_elements = self._get_card_elements()
-        seen_urls: set[str] = set()
-        records: list[dict] = []
-
-        for card_el in card_elements:
-            rec = self._extract_single_card(card_el, zip_code)
-            if rec is None:
-                continue
-            url = rec["url"]
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            records.append(rec)
-
-        return records
-
-    def _get_card_elements(self) -> list:
-        """Return WebElement list for all venue cards using first matching selector."""
-        for sel in VENUE_CARD:
+    def _is_zero_results(self) -> bool:
+        for sel in self.cfg["selectors"]["zero_results"]:
             try:
-                if _is_xpath(sel):
-                    els = self.browser.sb.driver.find_elements(By.XPATH, sel)
-                else:
-                    els = self.browser.sb.driver.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    return els
-            except Exception:
-                continue
+                if self.browser.sb.driver.find_elements(By.XPATH if _is_xpath(sel) else By.CSS_SELECTOR, sel):
+                    return True
+            except: continue
+        return False
+
+    def _get_card_elements(self):
+        for sel in self.cfg["selectors"]["venue_card"]:
+            try:
+                els = self.browser.sb.driver.find_elements(By.XPATH if _is_xpath(sel) else By.CSS_SELECTOR, sel)
+                if els: return els
+            except: continue
         return []
 
-    def _extract_single_card(self, card_el, zip_code: str) -> Optional[dict]:
-        """
-        Extract name, URL, and open/closed status from a single WebElement.
-        Returns None if the element is not a valid restaurant card.
-        """
-        try:
-            # --- URL ---
-            url = self._extract_url_from_card(card_el)
-            if not url:
-                return None
-            # Only keep proper restaurant / venue paths
-            if not any(seg in url for seg in ("/restaurant/", "/venue/", "/delivery/")):
-                return None
-
-            # --- Name ---
-            name = self._extract_name_from_card(card_el)
-
-            # --- Closed status ---
-            is_closed = self._is_card_closed(card_el)
-
-            return {
-                "name":       name,
-                "url":        url,
-                "status":     "closed" if is_closed else "open",
-                "zip_code":   zip_code,
-                "scraped_at": _now_iso(),
-                "worker_id":  self.worker_id,
-            }
-        except Exception:
-            return None
-
-    def _extract_url_from_card(self, card_el) -> str:
-        """Try to find a restaurant URL from the card element or its anchor child."""
-        # The card itself might be an <a>
-        try:
-            href = card_el.get_attribute("href") or ""
-            if href and href.startswith("http"):
-                return href
-        except Exception:
-            pass
-
-        # Look for nested <a> tags
-        try:
-            anchors = card_el.find_elements(By.TAG_NAME, "a")
-            for a in anchors:
-                href = a.get_attribute("href") or ""
-                if href and any(
-                    seg in href for seg in ("/restaurant/", "/venue/", "/delivery/")
-                ):
-                    return href
-        except Exception:
-            pass
-
-        return ""
-
-    def _extract_name_from_card(self, card_el) -> str:
-        """Try each VENUE_NAME selector within the card element."""
-        for sel in VENUE_NAME:
-            try:
-                if _is_xpath(sel):
-                    els = card_el.find_elements(By.XPATH, sel)
-                else:
-                    els = card_el.find_elements(By.CSS_SELECTOR, sel)
-                for el in els:
-                    text = el.text.strip()
-                    if text:
-                        return text
-            except Exception:
-                continue
-
-        # Last resort: card's own text (first non-empty line)
-        try:
-            for line in card_el.text.splitlines():
-                line = line.strip()
-                if line:
-                    return line
-        except Exception:
-            pass
-
-        return ""
-
-    def _is_card_closed(self, card_el) -> bool:
-        """Return True if any closed-indicator is found within the card."""
-        for sel in VENUE_CLOSED:
-            try:
-                if _is_xpath(sel):
-                    els = card_el.find_elements(By.XPATH, sel)
-                else:
-                    els = card_el.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    return True
-            except Exception:
-                continue
-
-        # Check aria-disabled on the card root
-        try:
-            if card_el.get_attribute("aria-disabled") == "true":
-                return True
-        except Exception:
-            pass
-
-        # Check data-unavailable attribute
-        try:
-            if card_el.get_attribute("data-unavailable") == "true":
-                return True
-        except Exception:
-            pass
-
-        return False
-
-    # ------------------------------------------------------------------
-    # Selector utilities
-    # ------------------------------------------------------------------
-
-    def _find_first(self, selectors: list[str], timeout: float = 8.0):
-        """
-        Try each selector in order and return the first WebElement found
-        within *timeout* seconds total. Returns None if all fail.
-        """
+    def _find_first(self, selectors: List[str], timeout: int = 8):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for sel in selectors:
+            for s in selectors:
                 try:
-                    if _is_xpath(sel):
-                        els = self.browser.sb.driver.find_elements(By.XPATH, sel)
-                    else:
-                        els = self.browser.sb.driver.find_elements(By.CSS_SELECTOR, sel)
-                    visible = [e for e in els if e.is_displayed()]
-                    if visible:
-                        return visible[0]
-                except Exception:
-                    continue
+                    el = self.browser.sb.driver.find_element(By.XPATH if _is_xpath(s) else By.CSS_SELECTOR, s)
+                    if el.is_displayed(): return el
+                except: continue
             time.sleep(0.5)
         return None
 
-    # ------------------------------------------------------------------
-    # Persistence — per-worker JSONL, no shared file, no lock needed
-    # ------------------------------------------------------------------
-
-    def _save_records(self, records: list[dict]):
-        """
-        Append records to this worker's JSONL file.
-        One JSON object per line — safe for concurrent workers because
-        each writes to its own file (results_{worker_id}.jsonl).
-        """
-        if not records:
-            return
+    def _save_records(self, records: List[Dict]):
+        if not records: return
         with self._out_path.open("a", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI Entry Point
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="WF-03: Scout Wolt for restaurant URLs by German ZIP code."
-    )
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--chunk-file",
-        metavar="PATH",
-        help="Path to a chunk JSON file produced by tools/chunker.py",
-    )
-    group.add_argument(
-        "--zip",
-        metavar="XXXXX",
-        help="Single ZIP code (for testing / debugging)",
-    )
-    p.add_argument(
-        "--worker-id",
-        required=True,
-        metavar="ID",
-        help="Unique worker identifier, e.g. worker-01 or 1",
-    )
-    p.add_argument(
-        "--save-closed",
-        action="store_true",
-        help="Include closed restaurants in output (default: open only)",
-    )
-    p.add_argument(
-        "--no-headless",
-        action="store_true",
-        help="Show the browser window (useful for debugging selector issues)",
-    )
+def parse_args():
+    p = argparse.ArgumentParser(description="Unified Production Scout")
+    p.add_argument("--chunk-file", required=True, help="Path to ZIP chunk JSON")
+    p.add_argument("--worker-id", required=True, help="Unique ID for this worker instance")
+    p.add_argument("--platform", choices=["wolt", "uber"], required=True, help="Target platform")
+    p.add_argument("--save-closed", action="store_true", help="Include closed restaurants")
     return p.parse_args()
 
-
-def load_zip_codes(args: argparse.Namespace) -> list[str]:
-    if args.zip:
-        return [args.zip.strip()]
-
-    chunk_path = Path(args.chunk_file)
-    if not chunk_path.exists():
-        print(f"ERROR: chunk file not found: {chunk_path}", file=sys.stderr)
-        sys.exit(1)
-
-    with chunk_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    codes = data.get("codes", [])
-    if not codes:
-        print("ERROR: chunk file contains no codes", file=sys.stderr)
-        sys.exit(1)
-
-    return codes
-
-
 def main():
-    args    = parse_args()
-    wid     = args.worker_id
-    log     = ScraperLogger(worker_id=wid)
-    state   = StateManager(f"scout_{wid}")
-    zips    = load_zip_codes(args)
-    headless = not args.no_headless and HEADLESS
+    args = parse_args()
+    log  = ScraperLogger(args.worker_id)
+    state = StateManager(f"scout_{args.worker_id}")
+    
+    with open(args.chunk_file, "r") as f:
+        data = json.load(f)
+        zips = data.get("codes", [])
 
     log.info(
         action="SCOUT_INIT",
-        message=f"Worker {wid} | {len(zips)} ZIPs | headless={headless} | save_closed={args.save_closed}",
-        zip_count=len(zips),
-        headless=headless,
-        save_closed=args.save_closed,
+        message=f"Worker {args.worker_id} | Platform: {args.platform} | {len(zips)} ZIPs",
     )
 
-    with BrowserDriver(worker_id=wid, headless=headless, logger=log) as browser:
-        scout = WoltScout(
-            worker_id=wid,
+    with BrowserDriver(worker_id=args.worker_id, headless=HEADLESS, logger=log) as browser:
+        scout = ProductionScout(
+            platform_key=args.platform,
+            worker_id=args.worker_id,
             browser=browser,
             log=log,
             state=state,
-            save_closed=args.save_closed,
+            save_closed=args.save_closed
         )
         summary = scout.run(zips)
 
-    log.info(action="SCOUT_DONE", message=str(summary), **summary)
-    print(f"\nDone. Summary: {summary}")
-    print(f"Results → {ROOT / '.tmp' / f'results_{wid}.jsonl'}")
-
+    log.info(action="SCOUT_DONE", message=f"Run complete: {summary}")
 
 if __name__ == "__main__":
     main()
