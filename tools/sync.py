@@ -76,6 +76,16 @@ def main():
     chunk_size = 1000
     logging.info(f"Loaded {total_rows} rows from {blender_file}. Pushing in chunks of {chunk_size}...")
 
+    # Ensure sheet has enough capacity to avoid Grid Limit errors
+    max_cols = max((len(row) for row in data), default=1)
+    try:
+        new_rows = max(1000, total_rows + 500) # Give 500 rows padding
+        new_cols = max(26, max_cols + 5)
+        worksheet.resize(rows=new_rows, cols=new_cols)
+        logging.info(f"Resized worksheet grid to {new_rows} rows and {new_cols} cols.")
+    except Exception as e:
+        logging.warning(f"Could not resize worksheet: {e}")
+
     def colnum_string(n):
         string = ""
         while n > 0:
