@@ -228,6 +228,7 @@ class BrowserDriver:
             uc=True,
             headless=self.headless,
             agent=ua,
+            page_load_strategy="eager",
             # window_size not a SB kwarg — we set it after launch
         )
         if self._current_proxy():

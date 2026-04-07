@@ -39,6 +39,7 @@ Output:
 import argparse
 import json
 import re
+import requests
 import sys
 import time
 import random
@@ -319,10 +320,6 @@ class LegalExtractor:
     # ──────────────────────────────────────────────────────────────────────
 
     def _process_record(self, record: dict, bound) -> dict:
-        """
-        Full pipeline for one restaurant record.
-        Raises on any unrecoverable error — retry wrapper handles it.
-        """
         url      = record["url"]
         platform = _detect_platform(url)
         self.state.mark_in_progress(url)
@@ -330,17 +327,58 @@ class LegalExtractor:
         bound.info(action="EXTRACT_START", status="TRY",
                    message=f"[{platform}] {record.get('name', '?')}", url=url)
 
-        # 1. Open the restaurant page
-        ok = self.browser.open(url, gdpr=True)
+        # ==========================================
+        # 🚀 ANTIGRAVITY FAST-PATH (HTTP BYPASS)
+        # ==========================================
+        # Attempt a raw HTTP GET first. If Cloudflare allows it and the data is SSR'd
+        # (like Wolt), we bypass the 8-second browser routine entirely.
+        try:
+            fast_resp = requests.get(
+                url, 
+                timeout=4,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+                }
+            )
+            if fast_resp.status_code == 200:
+                fast_text = _clean(fast_resp.text)
+                if _has_legal_signal(fast_text):
+                    fields = self._parse_legal_fields(fast_text)
+                    if fields.get("owner") or fields.get("legal_entity"):
+                        bound.info(action="FAST_PATH_HIT", status="SUCCESS", message="Extracted via 0.5s HTTP bypass")
+                        fields["impressum_url"] = url
+                        fields["impressum_source"] = "http_fast_path"
+                        fields["raw_snippet"] = fast_text[:600]
+                        fields["extract_status"] = "ok"
+                        
+                        return {
+                            **record,
+                            "extracted_at": _now_iso(),
+                            **fields,
+                        }
+        except Exception:
+            pass # Silently fallback to Selenium
+
+        # ==========================================
+        # 🐢 SLOW-PATH: SELENIUM (For Uber Eats / Blocked Pages)
+        # ==========================================
+        if hasattr(self.browser.sb, "uc_open_with_reconnect"):
+            try:
+                self.browser.sb.uc_open_with_reconnect(url, 4)
+                ok = True
+            except Exception:
+                ok = self.browser.open(url, gdpr=True)
+        else:
+            ok = self.browser.open(url, gdpr=True)
+
         if not ok:
-            raise RuntimeError(f"browser.open() failed for {url}")
+            raise RuntimeError(f"browser.open() failed for {url} (Likely blocked by Cloudflare)")
 
         time.sleep(random.uniform(*PAGE_LOAD_WAIT))
 
-        # 2. Hunt for the Impressum page / text block
         impressum_text, impressum_url, source = self._hunt_impressum(url, platform, bound)
 
-        # 3. Parse legal fields from whatever text we found
         fields = self._parse_legal_fields(impressum_text)
         fields["impressum_url"]    = impressum_url
         fields["impressum_source"] = source
@@ -348,7 +386,7 @@ class LegalExtractor:
         fields["extract_status"]   = "ok" if impressum_text else "not_found"
 
         result = {
-            **record,                    # carry all scout fields forward
+            **record,
             "extracted_at": _now_iso(),
             **fields,
         }
@@ -356,11 +394,7 @@ class LegalExtractor:
         bound.info(
             action="EXTRACT_DONE",
             status=fields["extract_status"],
-            message=(
-                f"owner={fields.get('owner') or '-'} | "
-                f"entity={fields.get('legal_entity') or '-'} | "
-                f"phone={fields.get('phone') or '-'}"
-            ),
+            message=f"owner={fields.get('owner') or '-'} | entity={fields.get('legal_entity') or '-'} | phone={fields.get('phone') or '-'}",
             url=url,
         )
         return result
