@@ -75,9 +75,9 @@ SCROLL_WAIT     = (0.8, 1.3)   # pause after scroll during link hunt
 # bleeds across a line-break into the next keyword (e.g. "Vertreten durch").
 OWNER_RE = re.compile(
     r"(?i)"
-    r"(?:Inhaber|Gesch[äa]ftsf[üu]hrer|Vertreten[ \t]+durch|Representative|Director)"
-    r"[ \t]*:?[ \t]*"
-    r"([A-ZÄÖÜ][a-zäöüß]+(?:[ \t][A-ZÄÖÜ][a-zäöüß]+){1,2})"
+    r"(?:Inhaber|Gesch[äa]ftsf[üu]hrer|Vertreten[ \t]+durch|Representative|Director|Name[ \t]+des[ \t]+Vertretungsberechtigten)"
+    r"[\s:]+"
+    r"([A-ZÄÖÜ][a-zäöüß]+(?:[ \t][A-ZÄÖÜ][a-zäöüß]+){0,3})"
 )
 
 # Legal entity — standalone line ending with a recognised German legal suffix
@@ -700,13 +700,14 @@ class LegalExtractor:
         Always returns all keys (empty string when not found).
         """
         if not text:
-            return {"owner": "", "legal_entity": "", "phone": "", "email": ""}
+            return {"owner": "", "legal_entity": "", "phone": "", "email": "", "address": ""}
 
         fields = {
             "owner":        self._extract_owner(text),
             "legal_entity": self._extract_entity(text),
             "phone":        self._extract_phone(text),
             "email":        self._extract_email(text),
+            "address":      self._extract_address(text),
         }
 
         # CORPORATE BLACKLIST: Identify Platform Overrides
@@ -752,6 +753,11 @@ class LegalExtractor:
         Prefers names found on their own line (standalone pattern).
         Falls back to inline occurrence.
         """
+        # Priority 0: Uber Eats specific "Firma" label
+        m_firma = re.search(r"(?i)Firma[\s:]+([^\n]+)", text)
+        if m_firma:
+            return _clean(m_firma.group(1))
+
         # Priority 1: standalone line ending with a legal suffix
         standalone = re.compile(
             r"^([A-ZÄÖÜ0-9][A-Za-z0-9ÄÖÜäöüß\s&,.\-\']{1,60}\s*" + _SUFFIX + r")\s*$",
@@ -781,6 +787,17 @@ class LegalExtractor:
         """Extract the first e-mail address."""
         m = EMAIL_RE.search(text)
         return m.group(0).lower() if m else ""
+
+    def _extract_address(self, text: str) -> str:
+        # Uber Eats format: "Dircksenstr., 117, Berlin, 10178"
+        m_uber = re.search(r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,35}?,?\s*\d{1,4}[a-zA-Z]?[,\s]+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,30}?[,\s]+\d{5})(?!\d)", text)
+        if m_uber: return _clean(m_uber.group(1))
+        
+        # Standard format: "Musterstraße 1, 12345 Berlin"
+        m_std = re.search(r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,35}?\s+\d{1,4}[a-zA-Z]?\s*,?\s*\d{5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,30})(?![A-Za-z])", text)
+        if m_std: return _clean(m_std.group(1))
+        
+        return ""
 
     # ──────────────────────────────────────────────────────────────────────
     # DOM helpers
@@ -832,6 +849,7 @@ class LegalExtractor:
             "legal_entity":    "",
             "phone":           "",
             "email":           "",
+            "address":         "",
             "raw_snippet":     "",
             "error":           error,
         }
@@ -845,6 +863,7 @@ _LEGAL_KEYWORDS = frozenset([
     "impressum", "inhaber", "geschäftsführer", "vertreten durch",
     "handelsregister", "ust-id", "umsatzsteuer", "amtsgericht",
     "representative", "director", "legal notice", "rechtliche hinweise",
+    "vertretungsberechtigten", "firma",
 ])
 
 _LEGAL_HREF_FRAGMENTS = frozenset([
