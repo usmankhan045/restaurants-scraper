@@ -1,13 +1,10 @@
-name: Scraper Pipeline
+name: Scraper Pipeline (5-ZIP TEST)
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
-  # PHASE 1: Generate ZIP chunks (One-time setup)
+  # PHASE 0: Generate ZIP chunks (TEST MODE)
   setup:
     name: Generate Chunks
     runs-on: ubuntu-latest
@@ -15,89 +12,125 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
-      
       - name: Install Setup Dependencies
         run: pip install requests
-          
-      # WF-01 & WF-02
       - name: Generate PLZ Master and Chunks
         run: |
           mkdir -p data .tmp/chunks
           python tools/plz_gen.py
-          python tools/chunker.py
-          
+          # The --test flag limits input to the 5 ZIPs in config.py
+          python tools/chunker.py --test 
       - name: Upload Chunks
         uses: actions/upload-artifact@v4
         with:
           name: plz-chunks
           path: .tmp/chunks/
 
-  # PHASE 2: Parallel Scraping and Extraction
-  scout_and_extract:
-    name: Scout & Extract
+  # PHASE 1: Rapid Discovery (5 Runners)
+  discovery:
+    name: Discovery (Scout)
     needs: setup
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        runner_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        # Reduced to 5 runners for the 5 validation ZIPs
+        runner_index: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
-        
       - name: Download Chunks
         uses: actions/download-artifact@v4
         with: { name: plz-chunks, path: .tmp/chunks/ }
-        
-      - name: Install Dependencies
+      - name: Install Deps
         run: |
           pip install -r requirements.txt
           sbase install chromedriver
-          
-      # WF-03 (Wolt) & WF-04 (Uber Eats)
-      - name: Run Scout (Discovery)
+      - name: Run Scout
         run: |
           CHUNK_NAME=$(printf "chunk_%02d.json" ${{ matrix.runner_index }})
-          python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id ${{ matrix.runner_index }}
-          
-      # WF-06 & WF-07
-      - name: Run Extractor (Deep Detail)
-        run: |
-          python tools/extractor.py --worker-id ${{ matrix.runner_index }}
-          
-      - name: Upload Worker Results
-        if: always()
+          python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id scout-${{ matrix.runner_index }}
+      - name: Upload Raw URLs
         uses: actions/upload-artifact@v4
         with:
-          name: worker-data-${{ matrix.runner_index }}
-          path: .tmp/*.jsonl
+          name: raw-urls-${{ matrix.runner_index }}
+          path: .tmp/results_*.jsonl
 
-  # PHASE 3: Merge and Sync (WF-08)
-  collector:
-    name: Blender & Sync
-    needs: scout_and_extract
+  # PHASE 2: Global Deduplication (1 Runner)
+  deduplicate:
+    name: Unique URL Registry
+    needs: discovery
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
-        
+      - uses: actions/download-artifact@v4
+        with: { path: .tmp_all/ }
+      - name: Create Unique URL Shards
+        run: |
+          mkdir -p .tmp/shards
+          # Merge all discovery results and extract unique URLs
+          cat .tmp_all/raw-urls-*/results_*.jsonl | sort -u -t '"' -k 4,4 > .tmp/unique_urls.jsonl
+          # Split unique URLs into 5 shards for the test extraction matrix
+          split -l $(($(wc -l < .tmp/unique_urls.jsonl)/5 + 1)) .tmp/unique_urls.jsonl .tmp/shards/results_ext- --numeric-suffixes=1 --additional-suffix=.jsonl
+      - name: Upload Shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: unique-shards
+          path: .tmp/shards/
+
+  # PHASE 3: Parallel Extraction (5 Runners)
+  extraction:
+    name: Extraction
+    needs: deduplicate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard_index: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - uses: actions/download-artifact@v4
+        with: { name: unique-shards, path: .tmp/ }
+      - name: Install Deps
+        run: |
+          pip install -r requirements.txt
+          sbase install chromedriver
+      - name: Run Extractor
+        run: |
+          # Move shards to .tmp so extractor.py can find them based on worker-id
+          python tools/extractor.py --worker-id ext-${{ matrix.shard_index }}
+      - name: Upload Worker Detail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detail-${{ matrix.shard_index }}
+          path: .tmp/extracted_*.jsonl
+
+  # FINAL PHASE: Merge, Blend, and Sync
+  collector:
+    name: Blender & Sync
+    needs: extraction
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
       - name: Install Dependencies
         run: pip install -r requirements.txt
-        
       - name: Download All Data
         uses: actions/download-artifact@v4
         with: { path: .tmp_all/ }
-        
       - name: Run Blender
         run: |
           mkdir -p .tmp
-          # Combine all worker extraction files into one
-          cat .tmp_all/worker-data-*/extracted_*.jsonl > .tmp/all_extracted.jsonl
-          # Current blender expects wolt/uber files, passing merged file as both
-          python tools/blender.py --wolt-file .tmp/all_extracted.jsonl --uber-file .tmp/all_extracted.jsonl --output-json blender_output.json
-          
+          cat .tmp_all/detail-*/extracted_*.jsonl > .tmp/all_extracted.jsonl
+          # Separate platforms for the blender
+          grep '"platform": "wolt"' .tmp/all_extracted.jsonl > .tmp/wolt_extracted.jsonl || true
+          grep '"platform": "uber"' .tmp/all_extracted.jsonl > .tmp/uber_extracted.jsonl || true
+          python tools/blender.py --wolt-file .tmp/wolt_extracted.jsonl --uber-file .tmp/uber_extracted.jsonl --output-json blender_output.json
       - name: Run Google Sheets Sync
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}

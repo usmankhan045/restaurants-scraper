@@ -27,7 +27,7 @@ log = CustomLogger("chunker")
 
 PLZ_MASTER_PATH = ROOT / "data" / "plz_master.json"
 CHUNKS_DIR = ROOT / ".tmp" / "chunks"
-NUM_CHUNKS = 20
+NUM_CHUNKS = 100
 
 
 # ---------------------------------------------------------------------------
