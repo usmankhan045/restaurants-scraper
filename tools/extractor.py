@@ -892,8 +892,8 @@ def main():
 
         records = _load_results(results_path)
         if not records:
-            print("ERROR: results file is empty or contains no valid records.", file=sys.stderr)
-            sys.exit(1)
+            print("INFO: results file is empty or contains no valid records.", file=sys.stderr)
+            sys.exit(0)
 
     headless = not args.no_headless and HEADLESS
     log      = ScraperLogger(worker_id=wid)

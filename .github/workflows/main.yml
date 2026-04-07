@@ -70,8 +70,8 @@ jobs:
           # Combine all results from all platforms and workers
           find .tmp_all -type f -name "results_*.jsonl" -exec cat {} + | sort -u -t '"' -k 4,4 > .tmp/unique_urls.jsonl || true
           
-          # Initialize all 5 shards as empty files so extraction matrix jobs don't fail
-          for i in {1..5}; do touch ".tmp/results_ext-$i.jsonl"; done
+          # Initialize all 5 shards as 1-byte files (space) so extraction matrix jobs don't fail
+          for i in {1..5}; do echo " " > ".tmp/results_ext-$i.jsonl"; done
           
           lines=$(wc -l < .tmp/unique_urls.jsonl)
           if [ "$lines" -gt 0 ]; then
@@ -91,6 +91,7 @@ jobs:
         with:
           name: unique-shards
           path: .tmp/results_ext-*.jsonl
+          include-hidden-files: true
 
   extraction:
     name: Extraction
