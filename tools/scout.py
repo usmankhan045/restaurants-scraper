@@ -15,7 +15,7 @@ from selenium.webdriver.common.keys import Keys
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import MAX_RETRIES, REQUEST_DELAY_MIN, REQUEST_DELAY_MAX, HEADLESS
+from config import MAX_RETRIES, HEADLESS
 from tools.browser import BrowserDriver
 from tools.logger import ScraperLogger
 from tools.state_manager import StateManager
@@ -23,7 +23,7 @@ from tools.state_manager import StateManager
 KEYPRESS_DELAY_MS   = (50, 180)
 KEYPRESS_BURST_PROB = 0.12
 KEYPRESS_BURST_MS   = (250, 600)
-SCROLL_STALE_TIMEOUT = 12.0        # 12s buffer for slow Uber loading
+SCROLL_STALE_TIMEOUT = 12.0        
 SCROLL_PAUSE         = (1.5, 2.5)  
 SHOW_MORE_MAX        = 40          
 POST_LOAD_WAIT       = (3.0, 5.0)  
@@ -32,25 +32,23 @@ PLATFORM_CONFIG = {
     "wolt": {
         "url": "https://wolt.com/de/discovery",
         "selectors": {
-            "address_input": ["input[data-test-id='address-input']", "[data-test-id='front-page-address-input']", "[data-test-id='address-search-input']", "input[placeholder*='Adresse']"],
-            "address_suggestion": ["[data-test-id='address-suggestion-item']", "[data-test-id='autocomplete-suggestion-item']", "//ul[@data-test-id='address-suggestions']/li[1]"],
+            "address_input": ["input[data-test-id='address-input']", "input[placeholder*='Adresse']", "[data-test-id='front-page-address-input']"],
+            "address_suggestion": ["[data-test-id='address-suggestion-item']", "li[role='option']"],
             "venue_card": ["[data-test-id='venue-card']", "a[href*='/restaurant/']", "a[href*='/venue/']"],
-            "venue_name": ["[data-test-id='venue-card-header']", "[data-test-id='venue-name']", "h3", "h2"],
-            "venue_closed": ["[data-test-id='venue-card-closed-badge']", "[class*='closed']", "[class*='unavailable']"],
-            "zero_results": ["[data-test-id='discovery-no-venues']", "[data-test-id='empty-venue-list']"],
-            "show_more": ["[data-test-id='venue-list-loadmore-btn']", "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'mehr anzeigen')]"]
+            "venue_name": ["[data-test-id='venue-card-header']", "h3", "h2"],
+            "venue_closed": ["[data-test-id='venue-card-closed-badge']", "[class*='closed']"],
+            "zero_results": ["[data-test-id='discovery-no-venues']"]
         }
     },
     "uber": {
         "url": "https://www.ubereats.com/de",
         "selectors": {
             "address_input": ["input#location-typeahead-home-input", "input[placeholder*='adresse']"],
-            "address_suggestion": ["li[role='option']", "div[data-testid='location-typeahead-home-suggestion']", "//ul/li[1]"],
+            "address_suggestion": ["#location-typeahead-home-menu li", "li[role='option']", "div[data-testid='location-typeahead-home-suggestion']"],
             "venue_card": ["div[data-testid='store-card']", "a[href*='/restaurant/']", "a[href*='/store/']"],
             "venue_name": ["h3", "div[data-testid='store-card-title']"],
             "venue_closed": ["//span[contains(.,'Geschlossen')]", "[data-testid='closed-badge']"],
-            "zero_results": ["//h1[contains(.,'Keine Ergebnisse')]"],
-            "show_more": ["//button[contains(.,'Mehr anzeigen')]"]
+            "zero_results": ["//h1[contains(.,'Keine Ergebnisse')]"]
         }
     }
 }
@@ -121,7 +119,6 @@ class UnifiedScout:
 
         input_el = self._find_first(self.cfg["selectors"]["address_input"], timeout=20)
         
-        # Safely attempt captcha click ONLY if Cloudflare is blocking the input field
         if not input_el and self.platform == "wolt" and hasattr(self.browser.sb, "uc_gui_handle_captcha"):
             try:
                 self.browser.sb.uc_gui_handle_captcha()
@@ -238,24 +235,27 @@ class UnifiedScout:
     def _extract_single_card(self, card_el, zip_code: str) -> Optional[dict]:
         try:
             url = ""
-            
-            # THE FIX: Check if the card itself is the link (Uber Eats format)
             try:
                 href = card_el.get_attribute("href") or ""
-                if href and href.startswith("http"): url = href
+                if href and ("/" in href): url = href
             except: pass
             
-            # Fallback: Check for nested links inside the card (Wolt format)
             if not url:
                 try:
                     for a in card_el.find_elements(By.TAG_NAME, "a"):
                         h = a.get_attribute("href") or ""
-                        if any(s in h for s in ("/restaurant/", "/venue/", "/delivery/", "/store/")):
+                        if h and ("/" in h):
                             url = h
                             break
                 except: pass
                 
             if not url: return None
+            
+            # Handle relative URLs correctly
+            if url.startswith("/"):
+                base = "https://wolt.com" if self.platform == "wolt" else "https://www.ubereats.com"
+                url = base + url
+                
             clean_url = url.split("?")[0].split("#")[0].rstrip("/")
 
             name = "Unknown"

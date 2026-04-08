@@ -40,12 +40,14 @@ jobs:
       - name: Download Chunks
         uses: actions/download-artifact@v4
         with: { name: plz-chunks, path: .tmp/chunks/ }
-      - name: Install Deps
-        run: pip install -r requirements.txt && sbase install chromedriver
-      - name: Run Scout
+      - name: Install Deps & XVFB
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install -r requirements.txt && sbase install chromedriver
+      - name: Run Scout (Virtual Display)
         run: |
           CHUNK_NAME=$(printf "chunk_%02d.json" ${{ matrix.runner_index }})
-          python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id scout-${{ matrix.platform }}-${{ matrix.runner_index }} --platform ${{ matrix.platform }}
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tools/scout.py --chunk-file .tmp/chunks/$CHUNK_NAME --worker-id scout-${{ matrix.platform }}-${{ matrix.runner_index }} --platform ${{ matrix.platform }}
       - name: Upload Raw URLs
         uses: actions/upload-artifact@v4
         with:
@@ -67,16 +69,16 @@ jobs:
         run: |
           mkdir -p .tmp/shards
           touch .tmp/unique_urls.jsonl
-          
           find .tmp_all -type f -name "results_*.jsonl" -exec cat {} + | sort -u -t '"' -k 4,4 > .tmp/unique_urls.jsonl || true
           
-          # Initialize 20 shards
-          for i in {1..20}; do echo " " > ".tmp/results_ext-$i.jsonl"; done
+          # Initialize empty shards
+          for i in {1..20}; do echo "" > ".tmp/results_ext-$i.jsonl"; done
           
-          lines=$(wc -l < .tmp/unique_urls.jsonl)
+          # Remove blank lines to prevent JSON loading errors
+          lines=$(grep -cv '^\s*$' .tmp/unique_urls.jsonl || true)
           if [ "$lines" -gt 0 ]; then
-            # Divide massive URL list into 20 perfectly balanced chunks
-            split -l $((lines/20 + 1)) .tmp/unique_urls.jsonl .tmp/shards/shard_
+            grep -v '^\s*$' .tmp/unique_urls.jsonl > .tmp/clean_urls.jsonl
+            split -l $((lines/20 + 1)) .tmp/clean_urls.jsonl .tmp/shards/shard_
             i=1
             for f in .tmp/shards/shard_*; do
               if [ -e "$f" ]; then
@@ -98,7 +100,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: # Spreading load across 20 parallel workers
+      matrix:
         shard_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
       - uses: actions/checkout@v4
@@ -106,11 +108,13 @@ jobs:
         with: { python-version: '3.10' }
       - uses: actions/download-artifact@v4
         with: { name: unique-shards, path: .tmp/ }
-      - name: Install Deps
-        run: pip install -r requirements.txt && sbase install chromedriver
-      - name: Run Extractor
+      - name: Install Deps & XVFB
         run: |
-          python tools/extractor.py --worker-id ext-${{ matrix.shard_index }}
+          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install -r requirements.txt && sbase install chromedriver
+      - name: Run Extractor (Virtual Display)
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tools/extractor.py --worker-id ext-${{ matrix.shard_index }}
       - name: Upload Worker Detail
         if: always()
         uses: actions/upload-artifact@v4
