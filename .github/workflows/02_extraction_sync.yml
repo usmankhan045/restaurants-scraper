@@ -1,0 +1,213 @@
+name: 2. Extraction and Sync Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      discovery_run_id:
+        description: 'Run ID of the "1. Restaurant Discovery Pipeline" to process'
+        required: true
+        type: string
+
+jobs:
+  deduplicate:
+    name: Unique URL Registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download All Raw Results from Discovery Run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.inputs.discovery_run_id }}
+          pattern: raw-results-*
+          path: .tmp_all/
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge, Deduplicate, and Shard
+        run: |
+          mkdir -p .tmp/shards
+          
+          # Combine all results from both platforms
+          find .tmp_all -type f -name "results_*.jsonl" | while read f; do
+            cat "$f"
+          done > .tmp/all_raw.jsonl || true
+          
+          echo "Total raw lines: $(wc -l < .tmp/all_raw.jsonl)"
+          
+          python3 - <<'PYEOF'
+          import json
+          from pathlib import Path
+          
+          input_path  = Path(".tmp/all_raw.jsonl")
+          output_path = Path(".tmp/unique_urls.jsonl")
+          
+          seen_urls = set()
+          records   = []
+          
+          if input_path.exists():
+              with input_path.open("r", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          rec = json.loads(line)
+                          url = rec.get("url", "").rstrip("/")
+                          if url and url not in seen_urls:
+                              seen_urls.add(url)
+                              records.append(rec)
+                      except json.JSONDecodeError:
+                          pass
+          
+          print(f"Unique records after dedup: {len(records)}")
+          
+          with output_path.open("w", encoding="utf-8") as f:
+              for rec in records:
+                  f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+          PYEOF
+          
+          echo "Unique records: $(wc -l < .tmp/unique_urls.jsonl)"
+          
+          NUM_SHARDS=20
+          for i in $(seq 1 $NUM_SHARDS); do
+            > ".tmp/results_ext-${i}.jsonl"
+          done
+          
+          python3 - <<'PYEOF'
+          import json
+          from pathlib import Path
+          
+          records = []
+          if Path(".tmp/unique_urls.jsonl").exists():
+              with Path(".tmp/unique_urls.jsonl").open("r", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line:
+                          records.append(line)
+          
+          num_shards = 20
+          for i in range(num_shards):
+              shard_path = Path(f".tmp/results_ext-{i+1}.jsonl")
+              shard_lines = records[i::num_shards]
+              with shard_path.open("w", encoding="utf-8") as f:
+                  for line in shard_lines:
+                      f.write(line + "\n")
+              print(f"Shard {i+1}: {len(shard_lines)} records")
+          PYEOF
+
+      - name: Upload Shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: unique-shards
+          path: .tmp/results_ext-*.jsonl
+          include-hidden-files: true
+
+  extraction:
+    name: Extraction (shard-${{ matrix.shard_index }})
+    needs: deduplicate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+                      11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download Shards
+        uses: actions/download-artifact@v4
+        with:
+          name: unique-shards
+          path: .tmp/
+
+      - name: Install Dependencies
+        run: pip install requests python-dotenv
+
+      - name: Run Extractor
+        run: |
+          python tools/extractor.py --worker-id ext-${{ matrix.shard_index }}
+
+      - name: Upload Extracted Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-${{ matrix.shard_index }}
+          path: .tmp/extracted_*.jsonl
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  collector:
+    name: Blender and Sync
+    needs: extraction
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install requests python-dotenv gspread google-auth pandas rapidfuzz
+
+      - name: Download All Extracted Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: extracted-*
+          path: .tmp_all/
+          merge-multiple: true
+
+      - name: Merge Extracted Files
+        run: |
+          mkdir -p .tmp
+          find .tmp_all -name "extracted_*.jsonl" -exec cat {} + > .tmp/all_extracted.jsonl || true
+          echo "Total extracted records: $(wc -l < .tmp/all_extracted.jsonl)"
+          
+          python3 -c "
+          import json
+          wolt_out = open('.tmp/wolt_extracted.jsonl', 'w')
+          uber_out = open('.tmp/uber_extracted.jsonl', 'w')
+          try:
+              with open('.tmp/all_extracted.jsonl') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line: continue
+                      try:
+                          rec = json.loads(line)
+                          if rec.get('platform') == 'wolt':
+                              wolt_out.write(line + '\n')
+                          elif rec.get('platform') == 'uber':
+                              uber_out.write(line + '\n')
+                      except: pass
+          except FileNotFoundError: pass
+          wolt_out.close(); uber_out.close()
+          "
+
+      - name: Run Blender
+        run: |
+          python tools/blender.py \
+            --wolt-file .tmp/wolt_extracted.jsonl \
+            --uber-file .tmp/uber_extracted.jsonl \
+            --output-csv blender_output.csv
+
+      - name: Run Google Sheets Sync
+        env:
+          GCP_CREDENTIALS:  ${{ secrets.GCP_CREDENTIALS }}
+          GOOGLE_SHEET_ID:  ${{ secrets.GOOGLE_SHEET_ID }}
+          BLENDER_OUTPUT:   "blender_output.csv"
+        run: python tools/sync.py
+
+      - name: Upload Final CSV as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-output
+          path: blender_output.csv

@@ -1,0 +1,110 @@
+name: 1. Restaurant Discovery Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run in TEST MODE with only 5 ZIP codes?'
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 2 * * 0'
+
+jobs:
+  setup:
+    name: Generate Chunks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Setup Dependencies
+        run: pip install requests python-dotenv
+
+      - name: Generate PLZ Master and Chunks
+        run: |
+          mkdir -p data .tmp/chunks
+          if [ ! -f data/plz_master.json ]; then
+            python tools/plz_gen.py
+          else
+            echo "Using existing data/plz_master.json..."
+          fi
+          
+          if [ "${{ github.event.inputs.test_mode }}" == "true" ] || [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "Running Chunker in TEST MODE"
+            python tools/chunker.py --test
+          else
+            python tools/chunker.py
+          fi
+
+      - name: Verify zip_coords.json exists
+        run: |
+          if [ ! -f data/zip_coords.json ]; then
+            echo "ERROR: data/zip_coords.json is missing!"
+            exit 1
+          fi
+
+      - name: Upload Chunks and Coords
+        uses: actions/upload-artifact@v4
+        with:
+          name: plz-chunks
+          path: |
+            .tmp/chunks/
+            data/zip_coords.json
+          include-hidden-files: true
+
+  discovery:
+    name: Discovery (${{ matrix.platform }} chunk-${{ matrix.runner_index }})
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        runner_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                       11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        platform: [wolt, uber]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download Chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: plz-chunks
+          path: ./
+
+      - name: Install Dependencies
+        run: pip install requests python-dotenv
+
+      - name: Run API Scout
+        env:
+          UBER_SESSION_COOKIE: ${{ secrets.UBER_SESSION_COOKIE }}
+        run: |
+          CHUNK_NAME=$(printf "chunk_%02d.json" ${{ matrix.runner_index }})
+          # Soft skip if chunk doesn't exist (happens in testing)
+          if [ ! -f ".tmp/chunks/$CHUNK_NAME" ]; then
+             echo "Chunk $CHUNK_NAME not found (likely test mode). Skipping."
+             exit 0
+          fi
+          
+          python tools/scout_api.py \
+            --chunk-file .tmp/chunks/$CHUNK_NAME \
+            --worker-id  scout-${{ matrix.platform }}-${{ matrix.runner_index }} \
+            --platform   ${{ matrix.platform }}
+
+      - name: Upload Raw Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-results-${{ matrix.platform }}-${{ matrix.runner_index }}
+          path: .tmp/results_*.jsonl
+          if-no-files-found: ignore
+          include-hidden-files: true
