@@ -1,420 +1,221 @@
-"""
-WAT Framework — WF-04: Legal Data Extractor
-Hydration State Interception Architecture
-"""
-
 import argparse
 import json
-import re
-import requests
+import random
 import sys
 import time
-import random
+import re
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-
-from selenium.webdriver.common.by import By
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from config import MAX_RETRIES, HEADLESS
+from config import HEADLESS, MAX_RETRIES
 from tools.browser import BrowserDriver
 from tools.logger import ScraperLogger
 from tools.state_manager import StateManager
 
-# ---------------------------------------------------------------------------
-# Regex patterns
-# ---------------------------------------------------------------------------
-
+# The API-Safe Regex: Looks for JSON keys as well as HTML text
 OWNER_RE = re.compile(
-    r"(?i)(?:Firma|Inhaber|Gesch[äa]ftsf[üu]hrer|Vertreten[ \t]+durch|Name[ \t]+des[ \t]+Vertretungsberechtigten)[\s:\"\'\\]+([A-ZÄÖÜ][a-zäöüß]+(?:[ \t][A-ZÄÖÜ][a-zäöüß&0-9]+){0,4})"
+    r"(?i)(?:Firma|Inhaber|Gesch[äa]ftsf[üu]hrer|Vertreten[ \t]+durch|Name[ \t]+des[ \t]+Vertretungsberechtigten)[\s:\"\'\\]+([A-ZÄÖÜ][a-zäöüß]+(?:[ \t][A-ZÄÖÜ][a-zäöüß&0-9\.\-]+){0,4})"
 )
-
-_SUFFIX = (
-    r"(?:GmbH(?:\s*&\s*Co\.?\s*KG)?|"
-    r"UG\s*\(?haftungsbeschr[äa]nkt\)?|"
-    r"AG|KG|OHG|GbR|e\.K\.|e\.V\.|"
-    r"Ltd\.|LLC|SE|S\.à\s*r\.l\.)"
-)
-ENTITY_RE = re.compile(
-    r"([A-ZÄÖÜ0-9][A-Za-z0-9ÄÖÜäöüß\s&,.\-\']{1,60}\s*" + _SUFFIX + r")",
-    re.MULTILINE,
-)
-
-PHONE_RE = re.compile(
-    r"(?:"
-    r"(?:\+49|00\s?49)[\s.\-]?(?:\(0\)[\s.\-]?)?"
-    r"|0"
-    r")"
-    r"\d{2,5}"
-    r"[\s.\-/]?"
-    r"\d{3,12}"
-    r"(?:[\s.\-/]?\d{1,6})?",
-    re.MULTILINE,
-)
-
-EMAIL_RE = re.compile(
-    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
-)
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _clean(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-def _detect_platform(url: str) -> str:
-    u = url.lower()
-    if "wolt.com" in u:
-        return "wolt"
-    if "ubereats.com" in u:
-        return "ubereats"
-    return "generic"
-
-# ---------------------------------------------------------------------------
-# LegalExtractor
-# ---------------------------------------------------------------------------
 
 class LegalExtractor:
-    """
-    Visits restaurant URLs and extracts legal / Impressum data.
-    """
-    def __init__(
-        self,
-        worker_id: str,
-        browser: BrowserDriver,
-        log: ScraperLogger,
-        state: StateManager,
-    ):
+    def __init__(self, worker_id: str, browser: BrowserDriver, log: ScraperLogger, state: StateManager):
         self.worker_id = worker_id
-        self.browser   = browser
-        self.log       = log
-        self.state     = state
-
+        self.browser = browser
+        self.log = log
+        self.state = state
         self._out_path = ROOT / ".tmp" / f"extracted_{worker_id}.jsonl"
         self._out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def run(self, records: list[dict]) -> dict:
-        pending = [r for r in records if not self.state.is_completed(r["url"])]
-        skipped = len(records) - len(pending)
-
-        self.log.info(
-            action="EXTRACT_RUN_START",
-            message=f"{len(pending)} URLs to extract ({skipped} already done)",
-            pending=len(pending),
-            skipped=skipped,
-        )
-
-        for record in pending:
-            self._process_with_retry(record)
-
-        summary = self.state.summary()
-        self.log.info(action="EXTRACT_RUN_DONE", message=str(summary), **summary)
-        return summary
+    def run(self, input_file: Path) -> dict:
+        records = []
+        if input_file.exists():
+            with input_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip(): records.append(json.loads(line))
+        else:
+            self.log.warning(action="RUN", message="Input file does not exist, shard is empty.")
+            return {}
+                    
+        remaining = [r for r in records if r["url"] in self.state.pending([x["url"] for x in records])]
+        for rec in remaining:
+            self._process_with_retry(rec)
+        return self.state.summary()
 
     def _process_with_retry(self, record: dict):
-        url   = record["url"]
-        bound = self.log.bind(record.get("zip_code", ""))
-
-        for attempt in range(1, MAX_RETRIES + 1):
+        url = record["url"]
+        bound = self.log.bind(url)
+        for attempt in range(1, 4):
             try:
-                result = self._process_record(record, bound)
-                self._save_record(result)
-                self.state.mark_completed(url, metadata={
-                    "extract_status": result["extract_status"],
-                    "impressum_source": result.get("impressum_source", ""),
-                    "has_owner": bool(result.get("owner") and result.get("owner") != "Hidden by Platform"),
-                    "has_phone": bool(result.get("phone")),
-                })
+                res = self._process_record(record, bound)
+                with self._out_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(res, ensure_ascii=False) + "\n")
+                self.state.mark_completed(url)
                 return
-
-            except Exception as exc:
-                bound.retry(
-                    action="EXTRACT_RETRY",
-                    attempt=attempt,
-                    message=f"Attempt {attempt}/{MAX_RETRIES}: {exc}",
-                    url=url,
-                )
-                if attempt < MAX_RETRIES:
-                    try:
-                        self.browser._restart()
-                    except Exception:
-                        pass
-                    time.sleep(random.uniform(3.0, 6.0))
-                else:
-                    bound.error(
-                        action="EXTRACT_FAILED",
-                        message=f"All {MAX_RETRIES} attempts exhausted for {url}",
-                        url=url,
-                    )
-                    self.state.mark_failed(url, error=str(exc))
-                    self._save_record(self._failure_record(record, str(exc)))
+            except Exception as e:
+                if attempt == 3:
+                    self.state.mark_failed(url, str(e))
+                    with self._out_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(self._failure_record(record), ensure_ascii=False) + "\n")
+                time.sleep(2)
 
     def _process_record(self, record: dict, bound) -> dict:
-        url      = record["url"]
-        platform = _detect_platform(url)
-        self.state.mark_in_progress(url)
+        url = record["url"]
+        platform = "wolt" if "wolt" in url else "uber"
+        
+        bound.info(action="EXTRACT_START", status="TRY", message=f"[{platform}] {record.get('name', '')}")
 
-        bound.info(action="EXTRACT_START", status="TRY",
-                   message=f"[{platform}] {record.get('name', '?')}", url=url)
+        extracted_text = ""
+        source = "none"
 
-        # ==========================================
-        # 1. ANTIGRAVITY FAST-PATH (HTTP BYPASS)
-        # ==========================================
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/html, */*",
+            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8"
+        }
+
+        # -------------------------------------------------------------
+        # 1. API INTERCEPTION (Fast Path)
+        # -------------------------------------------------------------
         try:
-            fast_resp = requests.get(
-                url, 
-                timeout=5,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
-                }
-            )
-            if fast_resp.status_code == 200:
-                fast_text = fast_resp.text
-                fields = self._parse_legal_fields(fast_text)
-                
-                if fields.get("owner") not in ["", None, "Hidden by Platform"] or fields.get("email") or fields.get("address"):
-                    bound.info(action="FAST_PATH_HIT", status="SUCCESS", message="Extracted via HTTP bypass")
-                    fields["impressum_url"] = url
-                    fields["impressum_source"] = "http_hydration"
-                    fields["raw_snippet"] = fast_text[:600]
-                    fields["extract_status"] = "ok"
-                    
-                    return {
-                        **record,
-                        "extracted_at": _now_iso(),
-                        **fields,
-                    }
-        except Exception as e:
-            bound.debug(action="FAST_PATH_ERROR", status="SKIP", message=str(e))
+            if platform == "wolt":
+                # Intercept Wolt Backend API
+                slug = url.rstrip("/").split("/")[-1]
+                api_url = f"https://restaurant-api.wolt.com/v3/venues/slug/{slug}"
+                resp = requests.get(api_url, headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    extracted_text = json.dumps(resp.json(), ensure_ascii=False)
+                    source = "wolt_api"
+            elif platform == "uber":
+                # Intercept Uber React Hydration State
+                resp = requests.get(url, headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    text = resp.text
+                    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', text)
+                    if not m:
+                        m = re.search(r'<script type="application/json" id="main-initial-state">(.*?)</script>', text)
+                    if m:
+                        try:
+                            # Dump to clear unicode escapes
+                            json_data = json.loads(m.group(1))
+                            extracted_text = json.dumps(json_data, ensure_ascii=False)
+                            source = "uber_api"
+                        except:
+                            extracted_text = text
+                    else:
+                        extracted_text = text
+        except Exception:
+            pass
 
-        # ==========================================
-        # 2. SLOW-PATH: SELENIUM (The Deep Hunt)
-        # ==========================================
-        bound.info(action="SLOW_PATH", status="TRY", message="Fallback to Selenium")
-        
-        if hasattr(self.browser.sb, "uc_open_with_reconnect"):
+        fields = self._parse_legal_fields(extracted_text)
+
+        # -------------------------------------------------------------
+        # 2. SELENIUM FALLBACK (If Cloudflare blocked the API)
+        # -------------------------------------------------------------
+        if not fields.get("owner") and not fields.get("address"):
             try:
-                self.browser.sb.uc_open_with_reconnect(url, 4)
-                ok = True
-            except Exception:
-                ok = self.browser.open(url, gdpr=True)
-        else:
-            ok = self.browser.open(url, gdpr=True)
+                if hasattr(self.browser.sb, "uc_open_with_reconnect"):
+                    self.browser.sb.uc_open_with_reconnect(url, 4)
+                else:
+                    self.browser.open(url, gdpr=True)
+                
+                time.sleep(3)
+                
+                if platform == "wolt":
+                    self.browser.sb.driver.execute_script("document.querySelectorAll('[data-test-id=\\'venue-info-button\\'], button').forEach(b => { if(b.innerText.includes('Info')) b.click(); })")
+                    time.sleep(2)
+                elif platform == "uber":
+                    self.browser.sb.driver.execute_script("document.querySelectorAll('button').forEach(b => { if(b.innerText.includes('Mehr Info') || b.innerText.includes('More info')) b.click(); })")
+                    time.sleep(2)
+                    
+                extracted_text = self.browser.sb.get_page_source()
+                fields = self._parse_legal_fields(extracted_text)
+                source = "selenium_fallback"
+            except:
+                pass
 
-        if not ok:
-            raise RuntimeError(f"browser.open() failed for {url}")
-
-        if platform == "wolt":
-            time.sleep(2.0)
-            self.browser.sb.driver.execute_script("document.querySelectorAll('[data-test-id=\\'venue-info-button\\'], button').forEach(b => { if(b.innerText.includes('Info')) b.click(); })")
-            time.sleep(1.5)
-        elif platform == "ubereats":
-            time.sleep(2.0)
-            self.browser.sb.driver.execute_script("document.querySelectorAll('button').forEach(b => { if(b.innerText.includes('Mehr Info') || b.innerText.includes('More info')) b.click(); })")
-            time.sleep(1.5)
-        else:
-            time.sleep(2.5)
-
-        page_source = self.browser.sb.get_page_source()
-        fields = self._parse_legal_fields(page_source)
-
-        has_data = fields.get("owner") not in ["", None, "Hidden by Platform"] or fields.get("legal_entity") not in ["", None, "Hidden by Platform"] or fields.get("email")
-
-        fields["impressum_url"]    = url
-        fields["impressum_source"] = "selenium_fallback"
-        fields["raw_snippet"]      = page_source[:600] if page_source else ""
-        fields["extract_status"]   = "ok" if has_data else "not_found"
-
-        result = {
-            **record,
-            "extracted_at": _now_iso(),
-            **fields,
-        }
-
-        bound.info(
-            action="EXTRACT_DONE",
-            status=fields["extract_status"],
-            message=f"owner={fields.get('owner') or '-'} | entity={fields.get('legal_entity') or '-'} | phone={fields.get('phone') or '-'}",
-            url=url,
-        )
-        return result
-
-    def _parse_legal_fields(self, text: str) -> dict:
-        if not text:
-            return {"owner": "", "legal_entity": "", "phone": "", "email": "", "address": ""}
-
-        fields = {
-            "owner":        self._extract_owner(text),
-            "legal_entity": self._extract_entity(text),
-            "phone":        self._extract_phone(text),
-            "email":        self._extract_email(text),
-            "address":      self._extract_address(text),
-        }
-
-        banned_entities = ["uber portier", "wolt enterprises", "uber eats", "wolt.com", "uber.com"]
-        banned_emails = ["support@uber.com", "support@wolt.com", "hilfe@uber.com", "privacy@uber.com"]
+        # -------------------------------------------------------------
+        # 3. DATA GUARD & CLEANSING
+        # -------------------------------------------------------------
+        banned = ["uber portier", "wolt enterprises", "uber eats"]
         
-        if fields.get("phone"):
-            if fields["phone"].startswith("+31") or fields["phone"].startswith("0031") or fields["phone"].startswith("+358"):
-                fields["phone"] = None
-
-        if fields.get("email"):
-            if any(banned in fields["email"].lower() for banned in banned_emails):
-                fields["email"] = None
-
         if fields.get("owner"):
-            if any(banned in fields["owner"].lower() for banned in banned_entities):
-                fields["owner"] = None
+            if any(b in fields["owner"].lower() for b in banned):
+                fields["owner"] = "Hidden by Platform"
+        
+        if fields.get("email"):
+            if "uber.com" in fields["email"] or "wolt.com" in fields["email"]:
+                fields["email"] = "N/A"
 
-        if fields.get("legal_entity"):
-            if any(banned in fields["legal_entity"].lower() for banned in banned_entities):
-                fields["legal_entity"] = None
+        if not fields.get("owner"): fields["owner"] = "N/A"
+        if not fields.get("address"): fields["address"] = "N/A"
+        if not fields.get("email"): fields["email"] = "N/A"
+        if not fields.get("phone"): fields["phone"] = "N/A"
 
-        if not fields.get("email") and not fields.get("owner") and not fields.get("legal_entity"):
-            fields["owner"] = "Hidden by Platform"
-            fields["legal_entity"] = "Hidden by Platform"
+        bound.info(action="EXTRACT_DONE", status="ok" if fields["owner"] != "N/A" else "not_found", message=f"owner={fields['owner']} | source={source}")
 
-        return fields
-
-    def _extract_owner(self, text: str) -> str:
-        m = OWNER_RE.search(text)
-        return _clean(m.group(1)) if m else ""
-
-    def _extract_entity(self, text: str) -> str:
-        m_firma = re.search(r"(?i)Firma[\s:]+([^\n\"\'\\]+)", text)
-        if m_firma:
-            return _clean(m_firma.group(1))
-
-        standalone = re.compile(
-            r"^([A-ZÄÖÜ0-9][A-Za-z0-9ÄÖÜäöüß\s&,.\-\']{1,60}\s*" + _SUFFIX + r")\s*$",
-            re.MULTILINE,
-        )
-        m = standalone.search(text)
-        if m:
-            return _clean(m.group(1))
-
-        m = ENTITY_RE.search(text)
-        return _clean(m.group(1)) if m else ""
-
-    def _extract_phone(self, text: str) -> str:
-        m = PHONE_RE.search(text)
-        if not m:
-            return ""
-        raw = m.group(0).strip()
-        return re.sub(r"[\s.\-]{2,}", " ", raw).strip()
-
-    def _extract_email(self, text: str) -> str:
-        m = EMAIL_RE.search(text)
-        return m.group(0).lower() if m else ""
-
-    def _extract_address(self, text: str) -> str:
-        m_uber = re.search(r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,35}?,?\s*\d{1,4}[a-zA-Z]?[,\s]+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,30}?[,\s]+\d{5})(?!\d)", text)
-        if m_uber: return m_uber.group(1).replace('"', '').replace('\\', '').strip()
-        m_std = re.search(r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,35}?\s+\d{1,4}[a-zA-Z]?\s*,?\s*\d{5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,30})(?![A-Za-z])", text)
-        if m_std: return m_std.group(1).replace('"', '').replace('\\', '').strip()
-        return ""
-
-    def _save_record(self, record: dict):
-        with self._out_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    @staticmethod
-    def _failure_record(record: dict, error: str) -> dict:
         return {
             **record,
-            "extracted_at":    _now_iso(),
-            "extract_status":  "failed",
-            "impressum_url":   "",
-            "impressum_source": "",
-            "owner":           "",
-            "legal_entity":    "",
-            "phone":           "",
-            "email":           "",
-            "address":         "",
-            "raw_snippet":     "",
-            "error":           error,
+            "extracted_at": _now_iso(),
+            "impressum_source": source,
+            **fields
         }
 
-# ---------------------------------------------------------------------------
-# I/O helpers & CLI
-# ---------------------------------------------------------------------------
+    def _parse_legal_fields(self, text: str) -> dict:
+        if not text: return {}
+        fields = {}
+        
+        # 1. Owner Regex
+        m_owner = OWNER_RE.search(text)
+        if m_owner:
+            fields["owner"] = m_owner.group(1).replace('"', '').replace('\\', '').strip()
+            
+        m_firma = re.search(r'"Firma"\s*:\s*"([^"]+)"', text)
+        if m_firma: fields["owner"] = m_firma.group(1).replace('\\', '').replace('"', '').strip()
+            
+        # 2. Email Regex
+        m_email = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", text)
+        if m_email: fields["email"] = m_email.group(1)
+            
+        # 3. Phone Regex
+        m_phone = re.search(r"(?:\+49|0)[1-9][0-9 \-\(\)]{6,14}", text)
+        if m_phone: fields["phone"] = m_phone.group(0).strip()
+            
+        # 4. Address Regex
+        m_addr1 = re.search(r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,35}?,?\s*\d{1,4}[a-zA-Z]?[,\s]+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,30}?[,\s]+\d{5})(?!\d)", text)
+        m_addr2 = re.search(r"([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,35}?\s+\d{1,4}[a-zA-Z]?\s*,?\s*\d{5}\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\.\- ]{2,30})(?![A-Za-z])", text)
+        
+        if m_addr1: fields["address"] = m_addr1.group(1).replace('"', '').replace('\\', '').strip()
+        elif m_addr2: fields["address"] = m_addr2.group(1).replace('"', '').replace('\\', '').strip()
+        
+        return fields
 
-def _load_results(path: Path) -> list[dict]:
-    records = []
-    with path.open("r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                print(f"  WARN: skipping malformed line {lineno}: {exc}", file=sys.stderr)
-    return records
+    def _failure_record(self, record):
+        return {**record, "extracted_at": _now_iso(), "owner": "N/A", "address": "N/A", "email": "N/A", "phone": "N/A", "impressum_source": "failed"}
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="WF-04: Extract legal data (Impressum) from restaurant URLs."
-    )
-    source = p.add_mutually_exclusive_group(required=True)
-    source.add_argument("--worker-id", metavar="ID", help="Worker ID")
-    source.add_argument("--url", metavar="URL", help="Single URL")
-    p.add_argument("--results-file", metavar="PATH", help="Input file path")
-    p.add_argument("--no-headless", action="store_true", help="Show browser")
-    return p.parse_args()
+def _now_iso(): return datetime.now(timezone.utc).isoformat()
 
 def main():
-    args = parse_args()
-
-    if args.url:
-        wid     = "debug"
-        records = [{"url": args.url, "name": "debug", "zip_code": "", "status": "open"}]
-    else:
-        wid = args.worker_id
-        results_path = Path(args.results_file) if args.results_file \
-            else ROOT / ".tmp" / f"results_{wid}.jsonl"
-
-        if not results_path.exists():
-            print(f"ERROR: results file not found: {results_path}", file=sys.stderr)
-            sys.exit(1)
-
-        records = _load_results(results_path)
-        if not records:
-            print("INFO: results file empty.", file=sys.stderr)
-            sys.exit(0)
-
-    headless = not args.no_headless and HEADLESS
-    log      = ScraperLogger(worker_id=wid)
-    state    = StateManager(f"extract_{wid}")
-
-    log.info(
-        action="EXTRACTOR_INIT",
-        message=f"Worker {wid} | {len(records)} records | headless={headless}",
-        record_count=len(records),
-        headless=headless,
-    )
-
-    with BrowserDriver(worker_id=wid, headless=headless, logger=log) as browser:
-        extractor = LegalExtractor(
-            worker_id=wid,
-            browser=browser,
-            log=log,
-            state=state,
-        )
-        summary = extractor.run(records)
-
-    log.info(action="EXTRACTOR_DONE", message=str(summary), **summary)
-    print(f"\nDone. Summary: {summary}")
-    out = ROOT / ".tmp" / f"extracted_{wid}.jsonl"
-    print(f"Output → {out}")
+    p = argparse.ArgumentParser()
+    p.add_argument("--worker-id", required=True)
+    args = p.parse_args()
+    
+    wid = args.worker_id
+    log = ScraperLogger(worker_id=wid)
+    state = StateManager(f"ext_{wid}")
+    
+    # Locate the correct shard file assigned to this matrix worker
+    idx = wid.split("-")[-1]
+    input_file = ROOT / ".tmp" / f"results_ext-{idx}.jsonl"
+    
+    with BrowserDriver(worker_id=wid, headless=HEADLESS, logger=log) as browser:
+        ext = LegalExtractor(worker_id=wid, browser=browser, log=log, state=state)
+        summary = ext.run(input_file)
+        
+    log.info(action="EXTRACTOR_DONE", message=str(summary))
 
 if __name__ == "__main__":
     main()
