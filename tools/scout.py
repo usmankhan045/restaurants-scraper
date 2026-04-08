@@ -20,11 +20,10 @@ from tools.browser import BrowserDriver
 from tools.logger import ScraperLogger
 from tools.state_manager import StateManager
 
-# --- TIMING BOOSTED FOR GITHUB ACTIONS ---
 KEYPRESS_DELAY_MS   = (50, 180)
 KEYPRESS_BURST_PROB = 0.12
 KEYPRESS_BURST_MS   = (250, 600)
-SCROLL_STALE_TIMEOUT = 12.0        # FIX 1: Increased to 12s to allow lazy-loading
+SCROLL_STALE_TIMEOUT = 12.0        # 12s buffer for slow Uber loading
 SCROLL_PAUSE         = (1.5, 2.5)  
 SHOW_MORE_MAX        = 40          
 POST_LOAD_WAIT       = (3.0, 5.0)  
@@ -33,7 +32,6 @@ PLATFORM_CONFIG = {
     "wolt": {
         "url": "https://wolt.com/de/discovery",
         "selectors": {
-            "venue_rating": ["[data-test-id='venue-card-rating']", "[class*='VenueRating']", "div[class*='rating']"],
             "address_input": ["input[data-test-id='address-input']", "[data-test-id='front-page-address-input']", "[data-test-id='address-search-input']", "input[placeholder*='Adresse']"],
             "address_suggestion": ["[data-test-id='address-suggestion-item']", "[data-test-id='autocomplete-suggestion-item']", "//ul[@data-test-id='address-suggestions']/li[1]"],
             "venue_card": ["[data-test-id='venue-card']", "a[href*='/restaurant/']", "a[href*='/venue/']"],
@@ -46,7 +44,6 @@ PLATFORM_CONFIG = {
     "uber": {
         "url": "https://www.ubereats.com/de",
         "selectors": {
-            "venue_rating": ["div[data-testid='store-rating']", "span[data-testid='rich-text']"],
             "address_input": ["input#location-typeahead-home-input", "input[placeholder*='adresse']"],
             "address_suggestion": ["li[role='option']", "div[data-testid='location-typeahead-home-suggestion']", "//ul/li[1]"],
             "venue_card": ["div[data-testid='store-card']", "a[href*='/restaurant/']", "a[href*='/store/']"],
@@ -75,6 +72,7 @@ class UnifiedScout:
 
     def run(self, zip_codes: list[str]) -> dict:
         remaining = self.state.pending(zip_codes)
+        self.log.info(action="RUN_START", message=f"Platform: {self.platform.upper()} | {len(remaining)} ZIPs to process")
         for zip_code in remaining: self._process_zip_with_retry(zip_code)
         return self.state.summary()
 
@@ -85,11 +83,13 @@ class UnifiedScout:
                 self._process_zip(zip_code, bound)
                 return
             except Exception as exc:
+                bound.retry(action="ZIP_RETRY", attempt=attempt, message=f"Failed: {exc}")
                 if attempt < MAX_RETRIES:
                     try: self.browser._restart()
                     except: pass
                     time.sleep(random.uniform(3.0, 6.0))
                 else:
+                    bound.error(action="ZIP_FAILED", message="All attempts exhausted")
                     self.state.mark_failed(zip_code, error=str(exc))
 
     def _process_zip(self, zip_code: str, bound):
@@ -97,39 +97,55 @@ class UnifiedScout:
         if not self._navigate_to_zip(zip_code, bound): raise RuntimeError("Navigation failed")
         time.sleep(random.uniform(*POST_LOAD_WAIT))
         if self._is_zero_results():
+            bound.info(action="ZERO_RESULTS", message="No restaurants in area")
             self.state.mark_completed(zip_code, metadata={"count": 0, "zero_results": True})
             return
         self._smart_scroll(zip_code, bound)
         raw_records = self._extract_all_cards(zip_code)
         records = raw_records if self.save_closed else [r for r in raw_records if r["status"] == "open"]
         self._save_records(records)
+        bound.info(action="EXTRACT", message=f"Extracted {len(records)} active restaurants", raw_count=len(records))
         self.state.mark_completed(zip_code, metadata={"count": len(records)})
 
     def _navigate_to_zip(self, zip_code: str, bound) -> bool:
         target_url = self.cfg["url"]
-        if hasattr(self.browser.sb, "uc_open_with_reconnect"):
-            try:
+        bound.info(action="NAVIGATE", status="TRY", message=f"Opening {target_url}")
+        
+        try:
+            if hasattr(self.browser.sb, "uc_open_with_reconnect"):
                 self.browser.sb.uc_open_with_reconnect(target_url, 4)
-                # FIX 2: Wolt Turnstile physical click bypass
-                if self.platform == "wolt" and hasattr(self.browser.sb, "uc_gui_handle_captcha"):
-                    time.sleep(2)
-                    self.browser.sb.uc_gui_handle_captcha()
-            except:
+            else:
                 self.browser.open(target_url, gdpr=True)
-        else:
+        except:
             self.browser.open(target_url, gdpr=True)
 
         input_el = self._find_first(self.cfg["selectors"]["address_input"], timeout=20)
-        if not input_el: return False
+        
+        # Safely attempt captcha click ONLY if Cloudflare is blocking the input field
+        if not input_el and self.platform == "wolt" and hasattr(self.browser.sb, "uc_gui_handle_captcha"):
+            try:
+                self.browser.sb.uc_gui_handle_captcha()
+                input_el = self._find_first(self.cfg["selectors"]["address_input"], timeout=10)
+            except: pass
+
+        if not input_el:
+            bound.error(action="FIND_INPUT", message="Address input not found (Likely blocked by Cloudflare/Turnstile)")
+            return False
+            
         try: input_el.clear()
         except: pass
+        
         self._type_zip_human(input_el, zip_code, bound)
         time.sleep(random.uniform(1.0, 2.0))
+        
         if not self._click_suggestion(bound):
+            bound.warning(action="SUGGESTION", message="No suggestion found, pressing Enter")
             try:
                 input_el.send_keys(Keys.RETURN)
                 time.sleep(random.uniform(1.5, 2.5))
             except: return False
+            
+        bound.info(action="NAVIGATE", status="OK", message="ZIP entered")
         return True
 
     def _type_zip_human(self, element, zip_code: str, bound):
@@ -160,10 +176,12 @@ class UnifiedScout:
         return False
 
     def _smart_scroll(self, zip_code: str, bound):
+        bound.info(action="SCROLL_START", message="Starting smart scroll")
         last_count, stale_since, show_more_clicks = 0, None, 0
         while True:
             current_count = self._count_cards()
             if current_count > last_count:
+                bound.debug(action="SCROLL", message=f"Cards: {last_count} → {current_count}")
                 last_count = current_count
                 stale_since = None
             else:
@@ -174,6 +192,7 @@ class UnifiedScout:
                         stale_since = None
                         time.sleep(random.uniform(1.5, 2.5))
                         continue
+                    bound.info(action="SCROLL_DONE", message=f"Completed: {last_count} cards")
                     break
             self.browser.scroll_to_bottom()
             time.sleep(random.uniform(*SCROLL_PAUSE))
@@ -219,11 +238,25 @@ class UnifiedScout:
     def _extract_single_card(self, card_el, zip_code: str) -> Optional[dict]:
         try:
             url = ""
-            for a in card_el.find_elements(By.TAG_NAME, "a"):
-                h = a.get_attribute("href") or ""
-                if any(s in h for s in ("/restaurant/", "/venue/", "/delivery/", "/store/")):
-                    url = h.split("?")[0].split("#")[0].rstrip("/"); break
+            
+            # THE FIX: Check if the card itself is the link (Uber Eats format)
+            try:
+                href = card_el.get_attribute("href") or ""
+                if href and href.startswith("http"): url = href
+            except: pass
+            
+            # Fallback: Check for nested links inside the card (Wolt format)
+            if not url:
+                try:
+                    for a in card_el.find_elements(By.TAG_NAME, "a"):
+                        h = a.get_attribute("href") or ""
+                        if any(s in h for s in ("/restaurant/", "/venue/", "/delivery/", "/store/")):
+                            url = h
+                            break
+                except: pass
+                
             if not url: return None
+            clean_url = url.split("?")[0].split("#")[0].rstrip("/")
 
             name = "Unknown"
             for sel in self.cfg["selectors"]["venue_name"]:
@@ -232,7 +265,6 @@ class UnifiedScout:
                     if els and els[0].text.strip(): name = els[0].text.strip(); break
                 except: continue
 
-            # FIX 3: Detached Regex for Ratings
             text = card_el.text.strip()
             rating, reviews = "N/A", "N/A"
             m_rat = re.search(r"(?<!\d)([1-9][.,]\d|10[.,]0)(?!\d)", text)
@@ -248,7 +280,7 @@ class UnifiedScout:
                 except: continue
 
             return {
-                "name": name, "url": url, "platform": self.platform,
+                "name": name, "url": clean_url, "platform": self.platform,
                 "status": "closed" if is_closed else "open",
                 "rating": rating, "reviews": reviews,
                 "zip_code": zip_code, "scraped_at": _now_iso(), "worker_id": self.worker_id
@@ -290,8 +322,12 @@ def main():
     zips = [args.zip.strip()] if args.zip else json.load(open(args.chunk_file, "r", encoding="utf-8")).get("codes", [])
     headless = not args.no_headless and HEADLESS
 
+    log.info(action="SCOUT_INIT", message=f"Starting {plat} scout for {len(zips)} ZIPs")
+
     with BrowserDriver(worker_id=wid, headless=headless, logger=log) as browser:
         scout = UnifiedScout(platform=plat, worker_id=wid, browser=browser, log=log, state=state, save_closed=args.save_closed)
-        scout.run(zips)
+        summary = scout.run(zips)
+
+    log.info(action="SCOUT_DONE", message=str(summary))
 
 if __name__ == "__main__": main()
