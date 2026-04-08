@@ -146,7 +146,6 @@ def main():
 
     if not wolt_recs and not uber_recs:
         print("WARNING: Both input files are empty. Nothing to write.")
-        # Write empty CSV with headers so downstream steps don't crash
         with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
             w.writerow([
@@ -156,19 +155,48 @@ def main():
             ])
         return
 
-    # Group by ZIP code
-    zip_groups: dict[str, list[dict]] = defaultdict(list)
-    for r in wolt_recs + uber_recs:
-        zip_code = str(r.get("zip_code", "UNKNOWN")).strip()
-        zip_groups[zip_code].append(r)
+    # ── Global deduplication by URL slug ──────────────────────────────────────
+    # A restaurant on Wolt has ONE canonical URL (e.g. /de/restaurant/my-place).
+    # The same restaurant may appear in the raw results for many ZIP codes
+    # (because it delivers to all of them). We keep the record with the best
+    # data (non-N/A address wins; highest review count wins for rating).
+    def url_key(url: str) -> str:
+        """Normalise URL to a stable dedup key (strip trailing slash)."""
+        return url.rstrip("/").lower().split("?")[0]
 
-    # Merge within each ZIP
-    clean_data: list[dict] = []
-    for zip_code, records in zip_groups.items():
-        merged = merge_records(records)
-        clean_data.extend(merged)
+    seen: dict[str, dict] = {}  # key -> best record so far
 
-    print(f"After deduplication: {len(clean_data)} unique restaurants.")
+    for rec in wolt_recs + uber_recs:
+        url = rec.get("url", "")
+        if not url:
+            continue
+        key = url_key(url)
+        if key not in seen:
+            seen[key] = dict(rec)
+        else:
+            # Merge: fill gaps in the stored record with data from this one
+            existing = seen[key]
+            for field in ("address", "phone", "email", "rating", "reviews", "owner", "legal_entity"):
+                if coalesce(existing.get(field)) == "N/A":
+                    val = coalesce(rec.get(field))
+                    if val != "N/A":
+                        existing[field] = val
+            # Keep the record with more reviews (more reliable rating)
+            try:
+                if int(rec.get("reviews", 0)) > int(existing.get("reviews", 0)):
+                    existing["rating"]  = rec["rating"]
+                    existing["reviews"] = rec["reviews"]
+            except (ValueError, TypeError):
+                pass
+            # Track that this restaurant appears on multiple platforms
+            new_url = rec.get("url", "")
+            if new_url and new_url not in existing.get("url", ""):
+                existing["url"] = existing["url"] + " | " + new_url
+
+    clean_data = list(seen.values())
+    print(f"After global URL deduplication: {len(clean_data)} unique restaurants.")
+    print(f"  Input:  {len(wolt_recs) + len(uber_recs)} total records")
+    print(f"  Output: {len(clean_data)} unique restaurants")
 
     # Build separate URL columns for clarity
     def split_urls(url_str: str) -> tuple[str, str]:

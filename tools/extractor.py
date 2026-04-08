@@ -305,25 +305,19 @@ class Extractor:
 
     def _enrich(self, record: dict, platform: str) -> dict:
         """
-        Decide whether enrichment is needed and call the right function.
-        Records that came from scout_api.py already have good data —
-        we only re-fetch if key fields are still missing.
+        Wolt v4 API is no longer publicly accessible (returns 404).
+        Address is already captured during discovery. Phone/email are
+        not exposed by Wolt's public API. For Uber, attempt page scrape.
         """
-        needs_enrich = (
-            record.get("phone") in ("N/A", "", None)
-            or record.get("address") in ("N/A", "", None)
-        )
+        if platform == "uber":
+            needs_enrich = record.get("phone") in ("N/A", "", None)
+            if needs_enrich:
+                enriched = enrich_uber(record, self.log)
+                time.sleep(random.uniform(0.5, 1.2))
+                return enriched
 
-        if not needs_enrich:
-            return record  # already complete — pass through
-
-        if platform == "wolt":
-            enriched = enrich_wolt(record, self.log)
-        else:
-            enriched = enrich_uber(record, self.log)
-
-        time.sleep(random.uniform(0.5, 1.2))
-        return enriched
+        # Wolt: pass through as-is (address already populated from discovery)
+        return record
 
     def _write_failure(self, record: dict):
         failure = {

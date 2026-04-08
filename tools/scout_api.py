@@ -215,9 +215,12 @@ def process_wolt_zip(
         else:
             rating, reviews = "N/A", "N/A"
 
-        address = v.get("address") or "N/A"
+        # Address is available directly in the discovery response
+        address_raw = v.get("address") or ""
+        address = str(address_raw).strip() if address_raw else "N/A"
 
-        url = f"https://wolt.com/de/deu/{city_slug}/restaurant/{slug}" if city_slug else f"https://wolt.com/de/restaurant/{slug}"
+        # Canonical Wolt Germany URL - city_slug is empty in discovery so use simpler format
+        url = f"https://wolt.com/de/restaurant/{slug}"
 
         records.append({
             "name":       v.get("name", "Unknown"),
