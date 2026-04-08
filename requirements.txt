@@ -1,8 +1,18 @@
-requests
-python-dotenv
-seleniumbase
-selenium
-pandas
-rapidfuzz
-gspread
-google-auth
+# Core HTTP
+requests>=2.31.0
+python-dotenv>=1.0.0
+urllib3>=2.0.0
+
+# Data processing
+pandas>=2.0.0
+rapidfuzz>=3.0.0
+
+# Google Sheets sync
+gspread>=6.0.0
+google-auth>=2.20.0
+
+# NOTE: seleniumbase, selenium, and browser dependencies have been REMOVED.
+# The new architecture uses pure HTTP API calls — no browser required.
+# If you need to run the legacy scout.py for any reason, add:
+#   seleniumbase>=4.20.0
+#   selenium>=4.18.0
