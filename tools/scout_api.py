@@ -173,30 +173,7 @@ def wolt_discover(zip_code: str, lat: float, lon: float, log: ScraperLogger) -> 
     return []
 
 
-def wolt_enrich(slug: str, zip_code: str, log: ScraperLogger) -> dict:
-    """
-    Call Wolt's v4 venue detail endpoint to get phone, full address, etc.
-    Returns enrichment dict (may be empty if request fails).
-    """
-    session = _make_session()
-    url     = WOLT_VENUE_URL.format(slug=slug)
 
-    for attempt in range(1, 3):  # 2 attempts only — this is enrichment, not critical
-        try:
-            resp = session.get(url, headers=_wolt_headers(), timeout=10)
-            if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                if results:
-                    return results[0]
-            elif resp.status_code == 429:
-                time.sleep(10 * attempt)
-                continue
-            else:
-                break
-        except Exception:
-            time.sleep(3)
-
-    return {}
 
 
 def process_wolt_zip(
@@ -227,54 +204,30 @@ def process_wolt_zip(
         if not slug:
             continue
 
-        # Step 2: Enrich with v4 detail (phone, full address, web_page)
-        time.sleep(random.uniform(0.6, 1.2))
-        detail = wolt_enrich(slug, zip_code, log)
+        # Extractor (WF-04) will enrich missing details for UNIQUE URLs later.
+        city_raw = v.get("city", "")
+        city_slug = str(city_raw).lower().replace(" ", "-").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
 
-        # Build city slug for URL (e.g. "berlin" from city field)
-        city_raw = (
-            detail.get("city", {}).get("name", "")
-            or v.get("city", "")
-            or ""
-        )
-        city_slug = city_raw.lower().replace(" ", "-").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
-
-        # Rating — discovery response has rating as dict: {"score": 9.2, "volume": 340}
-        rating_obj = v.get("rating") or detail.get("rating") or {}
+        rating_obj = v.get("rating") or {}
         if isinstance(rating_obj, dict):
             rating  = str(rating_obj.get("score", "N/A"))
             reviews = str(rating_obj.get("volume", "N/A"))
         else:
             rating, reviews = "N/A", "N/A"
 
-        # Phone — v4 response field
-        phone = (
-            detail.get("public_phone")
-            or detail.get("phone")
-            or "N/A"
-        )
-        if phone and phone != "N/A":
-            phone = str(phone).strip()
+        address = v.get("address") or "N/A"
 
-        # Address
-        address = (
-            detail.get("address")
-            or v.get("address")
-            or "N/A"
-        )
-
-        # Build canonical URL
         url = f"https://wolt.com/de/deu/{city_slug}/restaurant/{slug}" if city_slug else f"https://wolt.com/de/restaurant/{slug}"
 
         records.append({
-            "name":       detail.get("name") or v.get("name", "Unknown"),
+            "name":       v.get("name", "Unknown"),
             "url":        url,
             "platform":   "wolt",
             "status":     "open" if v.get("online", True) else "closed",
             "rating":     rating,
             "reviews":    reviews,
             "address":    address,
-            "phone":      phone,
+            "phone":      "N/A",
             "email":      "N/A",
             "zip_code":   zip_code,
             "scraped_at": _now_iso(),
